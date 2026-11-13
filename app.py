@@ -15,13 +15,40 @@ import uvicorn
 app = FastAPI(title="Quant Lab: Full-History Multi-Timeframe Backtest, Hover HUD & Trade Log")
 
 # ==============================================================================
+# 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
+# ==============================================================================
+def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -> float:
+    """Safely converts any number/numpy scalar to a finite Python float."""
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return round(f, digits) if digits is not None else f
+    except Exception:
+        return default
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively cleans dicts/lists so json.dumps never sees NaN or Infinity."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+    elif isinstance(obj, (int, np.integer)):
+        return int(obj)
+    return obj
+
+
+# ==============================================================================
 # 1. DISK + MEMORY CACHE & MAX-LOOKBACK MULTI-SOURCE DATA ENGINE
 # ==============================================================================
 DATA_CACHE: Dict[str, pd.DataFrame] = {}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Full hierarchy now includes 1h (730d max)
 TIMEFRAME_HIERARCHY = ["1Y", "1M", "1W", "1d", "1h", "15m", "5m", "1m"]
 NEXT_TIMEFRAME = {
     "1Y": "1M",
@@ -34,7 +61,6 @@ NEXT_TIMEFRAME = {
     "1m": "1m"
 }
 
-# Maximum allowed lookback days per Yahoo Finance server constraints
 YF_LIMIT_DAYS = {
     "1h": 729,
     "15m": 59,
@@ -50,7 +76,7 @@ def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] 
     """
     now_ts = int((datetime.now() + timedelta(days=2)).timestamp())
     if days_back is None:
-        start_ts = 0  # Jan 1, 1970 -> pulls all history since IPO
+        start_ts = 0
     else:
         start_ts = int((datetime.now() - timedelta(days=days_back)).timestamp())
 
@@ -83,24 +109,21 @@ def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] 
     timestamps = result["timestamp"]
     quote = result["indicators"]["quote"][0]
 
-    # Use adjclose for daily if available so splits/dividends are clean
-    closes = quote["close"]
     df = pd.DataFrame({
         "open": quote["open"],
         "high": quote["high"],
         "low": quote["low"],
-        "close": closes,
+        "close": quote["close"],
         "volume": quote["volume"]
     }, index=pd.to_datetime(timestamps, unit="s"))
     df.index = df.index.tz_localize(None)
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    df["volume"] = df["volume"].fillna(0)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
+    df["volume"] = df["volume"].fillna(0.0).clip(lower=0.0)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     return df
 
 
 def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
-    """Free, un-throttled fallback for ALL available Daily historical OHLCV data via Stooq."""
     clean_t = ticker.upper().strip()
     url = f"https://stooq.com/q/d/l/?s={clean_t}.us&i=d"
     df = pd.read_csv(url)
@@ -111,11 +134,11 @@ def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
     df.columns = [c.lower() for c in df.columns]
     if "volume" not in df.columns:
         df["volume"] = 1000000.0
-    return df[["open", "high", "low", "close", "volume"]].dropna()
+    df = df[["open", "high", "low", "close", "volume"]].replace([np.inf, -np.inf], np.nan).dropna()
+    return df
 
 
 def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
-    """Secondary free fallback using Nasdaq's public chart API."""
     clean_t = ticker.upper().strip()
     end_dt = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
     start_dt = "1970-01-01"
@@ -148,12 +171,11 @@ def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
                         continue
                 if records:
                     df = pd.DataFrame(records).sort_values("date").set_index("date")
-                    return df[["open", "high", "low", "close", "volume"]].dropna()
+                    return df[["open", "high", "low", "close", "volume"]].replace([np.inf, -np.inf], np.nan).dropna()
     raise RuntimeError(f"Nasdaq API returned no data for {ticker}")
 
 
 def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
-    """Stitches four 7-day 1-minute windows for the maximum ~28-30 day Yahoo Finance lookback."""
     chunks = []
     now = datetime.now() + timedelta(days=1)
     t_obj = yf.Ticker(ticker)
@@ -174,13 +196,12 @@ def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
     if chunks:
         df_all = pd.concat(chunks).sort_index()
         df_all = df_all[~df_all.index.duplicated(keep='last')]
-        return df_all
+        return df_all.replace([np.inf, -np.inf], np.nan).dropna()
 
     return _direct_yahoo_v8_chart(ticker, interval="1m", days_back=7)
 
 
 def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.DataFrame:
-    """Reconstructs intraday bars anchored to real Daily OHLCV if Yahoo blocks intraday requests."""
     df_1d, _ = _download_daily_max(ticker)
     df_1d = df_1d.tail(days)
 
@@ -227,7 +248,6 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
 
 
 def _is_data_fresh(df: pd.DataFrame) -> bool:
-    """Checks that the DataFrame actually reaches within the last 10 days of today."""
     if df.empty:
         return False
     last_dt = pd.to_datetime(df.index[-1]).tz_localize(None)
@@ -235,10 +255,6 @@ def _is_data_fresh(df: pd.DataFrame) -> bool:
 
 
 def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
-    """
-    Fetches ALL 1-day bars from IPO up through today.
-    Compares providers if needed so the dataset never stops early (e.g. Jan 2026).
-    """
     csv_path = os.path.join(CACHE_DIR, f"{ticker}_1d_fullmax.csv")
 
     if os.path.exists(csv_path):
@@ -253,7 +269,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
 
     candidates: List[tuple[pd.DataFrame, Optional[str]]] = []
 
-    # 1. Try Direct Yahoo v8 Chart API with explicit period1=0 & period2=now
     try:
         df_v8 = _direct_yahoo_v8_chart(ticker, interval="1d", days_back=None)
         if not df_v8.empty:
@@ -264,14 +279,13 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     except Exception:
         pass
 
-    # 2. Try yfinance explicit start="1970-01-01" to tomorrow
     try:
         t_obj = yf.Ticker(ticker)
         end_str = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
         df_yf = t_obj.history(start="1970-01-01", end=end_str, interval="1d", auto_adjust=True)
         if not df_yf.empty:
             df_yf.index = pd.to_datetime(df_yf.index).tz_localize(None)
-            df_yf = df_yf[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+            df_yf = df_yf[['Open', 'High', 'Low', 'Close', 'Volume']].replace([np.inf, -np.inf], np.nan).dropna()
             df_yf.columns = ['open', 'high', 'low', 'close', 'volume']
             candidates.append((df_yf, None))
             if _is_data_fresh(df_yf):
@@ -280,7 +294,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     except Exception:
         pass
 
-    # 3. Try Stooq
     try:
         df_stooq = _fetch_stooq_daily(ticker)
         if not df_stooq.empty:
@@ -291,7 +304,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     except Exception:
         pass
 
-    # 4. Try Nasdaq API
     try:
         df_nas = _fetch_nasdaq_daily(ticker)
         if not df_nas.empty:
@@ -302,7 +314,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     except Exception:
         pass
 
-    # If none passed the strict 10-day freshness check (e.g. delisted ticker), pick the one with the latest end date & most bars
     if candidates:
         best_df, best_warn = max(candidates, key=lambda item: (item[0].index[-1], len(item[0])))
         best_df.to_csv(csv_path)
@@ -312,12 +323,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
 
 
 def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Optional[str]]:
-    """
-    Fetches maximum allowed intraday history:
-    - 1h: 729 days
-    - 15m / 5m: 59 days
-    - 1m: 28 days (stitched)
-    """
     max_days = YF_LIMIT_DAYS.get(interval, 59)
     csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_fullmax.csv")
 
@@ -342,7 +347,7 @@ def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Op
                 df = t_obj.history(period=f"{max_days}d", interval=interval, auto_adjust=True)
                 if not df.empty:
                     df.index = pd.to_datetime(df.index).tz_localize(None)
-                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].replace([np.inf, -np.inf], np.nan).dropna()
                     df.columns = ['open', 'high', 'low', 'close', 'volume']
 
         if not df.empty:
@@ -351,7 +356,6 @@ def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Op
     except Exception:
         pass
 
-    # Fallback: Reconstruct from real Daily OHLCV
     try:
         df_syn = _generate_intraday_from_daily(ticker, interval, max_days)
         return df_syn, (
@@ -363,11 +367,6 @@ def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Op
 
 
 def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional[str]]:
-    """
-    Constructs 1W, 1M, and 1Y directly from 100% of the 1-Day ('1d') historical dataset!
-    Labels each resampled bar at the START of its period (Jan 1 for 1Y, 1st of month for 1M,
-    Monday for 1W) so clicking a bar never cuts off the year or month.
-    """
     ticker = ticker.upper().strip()
     cache_key = f"{ticker}_{tf}_fullmax"
 
@@ -385,15 +384,11 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
         if tf == "1d":
             return df_base, warn_msg
 
-        # Construct Weekly, Monthly, and Yearly directly from the complete 1-day dataset
         if tf == "1W":
-            # Group by Monday of each week
             period_idx = df_base.index.to_period("W-SUN").start_time
         elif tf == "1M":
-            # Group by 1st day of each month
             period_idx = df_base.index.to_period("M").start_time
         else:  # "1Y"
-            # Group by Jan 1st of each year
             period_idx = df_base.index.to_period("Y").start_time
 
         df_res = df_base.groupby(period_idx).agg({
@@ -418,7 +413,7 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
 
 
 # ==============================================================================
-# 2. QUANTITATIVE INDICATORS & POINT-IN-TIME ENGINE (LONG & SHORT)
+# 2. QUANTITATIVE INDICATORS & POINT-IN-TIME ENGINE (ZERO-NaN GUARANTEED)
 # ==============================================================================
 def compute_all_indicators(
     df: pd.DataFrame,
@@ -437,34 +432,38 @@ def compute_all_indicators(
         return df, ["All Indicators (Empty Data)"]
 
     if n < 20:
-        unavailable_indicators.append("EMA 20 / Bollinger / GK Cone (Requires >= 20 bars)")
+        unavailable_indicators.append("EMA 20 / Bollinger / GK Cone (< 20 bars in view)")
     if n < 50:
-        unavailable_indicators.append("EMA 50 (Requires >= 50 bars)")
+        unavailable_indicators.append("EMA 50 (< 50 bars in view)")
 
-    df['ema20'] = df['close'].ewm(span=20, min_periods=min(5, n)).mean()
-    df['ema50'] = df['close'].ewm(span=50, min_periods=min(10, n)).mean()
+    # Use min_periods=1 so early IPO bars never contain NaN floats
+    df['ema20'] = df['close'].ewm(span=20, min_periods=1).mean().bfill().fillna(df['close'])
+    df['ema50'] = df['close'].ewm(span=50, min_periods=1).mean().bfill().fillna(df['close'])
 
-    high_low = df['high'] - df['low']
+    high_low = (df['high'] - df['low']).abs()
     high_close = (df['high'] - df['close'].shift(1)).abs()
     low_close = (df['low'] - df['close'].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(window=14, min_periods=1).mean()
+    df['atr'] = tr.rolling(window=14, min_periods=1).mean().bfill().fillna(df['close'] * 0.015)
+    df['atr'] = np.where(df['atr'] <= 0, df['close'] * 0.015, df['atr'])
 
-    log_hl = np.log((df['high'] / df['low'].replace(0, np.nan)).fillna(1.0))
-    log_co = np.log((df['close'] / df['open'].replace(0, np.nan)).fillna(1.0))
+    safe_low = df['low'].replace(0, np.nan).bfill().fillna(1.0)
+    safe_open = df['open'].replace(0, np.nan).bfill().fillna(1.0)
+    log_hl = np.log((df['high'] / safe_low).clip(lower=1e-6))
+    log_co = np.log((df['close'] / safe_open).clip(lower=1e-6))
     gk_var = (0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)).clip(lower=1e-8)
-    df['gk_vol_pct'] = np.sqrt(gk_var.ewm(span=20, min_periods=1).mean())
-    df['gk_sigma_dollar'] = df['gk_vol_pct'] * df['close']
+    df['gk_vol_pct'] = np.sqrt(gk_var.ewm(span=20, min_periods=1).mean()).bfill().fillna(0.02)
+    df['gk_sigma_dollar'] = (df['gk_vol_pct'] * df['close']).bfill().fillna(df['atr'])
 
-    drift = (df['close'] - df['close'].shift(3)).fillna(0) / 3.0
+    drift = ((df['close'] - df['close'].shift(3)).fillna(0.0)) / 3.0
     df['gk_upper'] = df['close'] + drift + (gk_mult * df['gk_sigma_dollar'])
     df['gk_lower'] = df['close'] + drift - (gk_mult * df['gk_sigma_dollar'])
 
     df['atr_upper'] = df['close'] + (atr_mult * df['atr'])
     df['atr_lower'] = df['close'] - (atr_mult * df['atr'])
 
-    df['vol_sma20'] = df['volume'].rolling(20, min_periods=1).mean()
-    df['rvol'] = (df['volume'] / df['vol_sma20'].replace(0, 1)).fillna(1.0)
+    df['vol_sma20'] = df['volume'].rolling(20, min_periods=1).mean().replace(0, 1.0).fillna(1.0)
+    df['rvol'] = (df['volume'] / df['vol_sma20']).replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     typical_price = (df['high'] + df['low'] + df['close']) / 3.0
     tp_vol = typical_price * df['volume']
@@ -472,32 +471,34 @@ def compute_all_indicators(
     if tf in ["15m", "5m", "1m"]:
         dates = df.index.date
         cum_tp_vol = tp_vol.groupby(dates).cumsum()
-        cum_vol = df['volume'].groupby(dates).cumsum().replace(0, 1)
-        df['vwap'] = cum_tp_vol / cum_vol
-        std_vwap = typical_price.groupby(dates).transform(lambda x: x.expanding().std()).fillna(df['atr'] * 0.5)
+        cum_vol = df['volume'].groupby(dates).cumsum().replace(0, 1.0)
+        df['vwap'] = (cum_tp_vol / cum_vol).bfill().fillna(df['close'])
+        std_vwap = typical_price.groupby(dates).transform(lambda x: x.expanding().std()).bfill().fillna(df['atr'] * 0.5)
     else:
-        df['vwap'] = tp_vol.rolling(20, min_periods=1).sum() / df['volume'].rolling(20, min_periods=1).sum().replace(0, 1)
-        std_vwap = df['close'].rolling(20, min_periods=1).std().fillna(df['atr'] * 0.5)
+        denom = df['volume'].rolling(20, min_periods=1).sum().replace(0, 1.0)
+        df['vwap'] = (tp_vol.rolling(20, min_periods=1).sum() / denom).bfill().fillna(df['close'])
+        std_vwap = df['close'].rolling(20, min_periods=1).std().bfill().fillna(df['atr'] * 0.5)
 
+    std_vwap = np.where(std_vwap <= 0, df['atr'] * 0.5, std_vwap)
     df['vwap_u2'] = df['vwap'] + 2.0 * std_vwap
     df['vwap_l2'] = df['vwap'] - 2.0 * std_vwap
 
-    delta = df['close'].diff()
+    delta = df['close'].diff().fillna(0.0)
     gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
     loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
     rs = gain / loss.replace(0, 1e-9)
-    df['rsi'] = 100 - (100 / (1 + rs))
+    df['rsi'] = (100.0 - (100.0 / (1.0 + rs))).bfill().fillna(50.0)
 
     swing_window = min(50, max(5, n))
-    df['swing_high'] = df['high'].rolling(swing_window, min_periods=1).max()
-    df['swing_low'] = df['low'].rolling(swing_window, min_periods=1).min()
+    df['swing_high'] = df['high'].rolling(swing_window, min_periods=1).max().bfill().fillna(df['high'])
+    df['swing_low'] = df['low'].rolling(swing_window, min_periods=1).min().bfill().fillna(df['low'])
     fib_range = (df['swing_high'] - df['swing_low']).replace(0, 1e-6)
     df['fib_382'] = df['swing_high'] - 0.382 * fib_range
     df['fib_500'] = df['swing_high'] - 0.500 * fib_range
     df['fib_618'] = df['swing_high'] - 0.618 * fib_range
     df['fib_786'] = df['swing_high'] - 0.786 * fib_range
 
-    body_prev = (df['close'].shift(1) - df['open'].shift(1)).abs()
+    body_prev = (df['close'].shift(1) - df['open'].shift(1)).abs().fillna(0.0)
     df['fvg_bull'] = (df['low'] > df['high'].shift(2)) & (body_prev > 0.8 * df['atr'])
     df['fvg_bull_top'] = np.where(df['fvg_bull'], df['low'], np.nan)
     df['fvg_bull_bot'] = np.where(df['fvg_bull'], df['high'].shift(2), np.nan)
@@ -558,22 +559,22 @@ def compute_all_indicators(
                 df.loc[group.index, 'orb_low'] = ol
                 df.loc[group.index, 'orb_mid'] = om
     else:
-        df['orb_high'] = df['high'].rolling(5, min_periods=1).max().shift(1)
-        df['orb_low'] = df['low'].rolling(5, min_periods=1).min().shift(1)
+        df['orb_high'] = df['high'].rolling(5, min_periods=1).max().shift(1).bfill().fillna(df['high'])
+        df['orb_low'] = df['low'].rolling(5, min_periods=1).min().shift(1).bfill().fillna(df['low'])
         df['orb_mid'] = (df['orb_high'] + df['orb_low']) / 2.0
 
-    slope_norm = np.clip(((df['ema20'] - df['ema50']) / df['atr'].replace(0, 1)), -2.0, 2.0) / 2.0
+    slope_norm = np.clip(((df['ema20'] - df['ema50']) / df['atr']), -2.0, 2.0) / 2.0
     bar_press = ((df['close'] - df['open']) / (df['high'] - df['low'] + 1e-9)) * np.clip(df['rvol'] / 2.0, 0, 2.0)
     liq_norm = np.clip(bar_press, -1.0, 1.0)
-    vwap_z = (df['close'] - df['vwap']) / std_vwap.replace(0, 1)
+    vwap_z = (df['close'] - df['vwap']) / std_vwap
     rev_norm = np.clip(-vwap_z / 2.5, -1.0, 1.0)
 
     total_w = abs(w_trend) + abs(w_liq) + abs(w_rev)
     if total_w == 0:
         total_w = 1.0
-    df['composite_score'] = (w_trend * slope_norm + w_liq * liq_norm + w_rev * rev_norm) / total_w
+    df['composite_score'] = ((w_trend * slope_norm + w_liq * liq_norm + w_rev * rev_norm) / total_w).fillna(0.0)
 
-    ema_diff_ratio = (df['ema20'] - df['ema50']).abs() / df['atr'].replace(0, 1)
+    ema_diff_ratio = (df['ema20'] - df['ema50']).abs() / df['atr']
     df['is_unclear_volatile'] = (ema_diff_ratio < 0.32) | (
         (df['atr'] > 1.35 * df['atr'].rolling(20, min_periods=1).mean()) & (df['composite_score'].abs() < 0.20)
     )
@@ -702,7 +703,7 @@ def run_strategy_backtest(
     alt_tp_price = 0.0
     entry_idx = 0
     position_shares = 0
-    entry_Signal_reason = ""
+    entry_signal_reason = ""
     dollar_risk_at_entry = 0.0
 
     trades = []
@@ -711,10 +712,12 @@ def run_strategy_backtest(
     equity_curve = []
 
     def _calc_shares(curr_eq: float, ep: float, slp: float) -> tuple[int, float]:
-        risk_budget = curr_eq * risk_per_trade_pct
-        max_pool_dollars = curr_eq * pool_fraction
-        stop_dist = max(abs(ep - slp), ep * 0.005)
+        risk_budget = max(curr_eq, 1000.0) * risk_per_trade_pct
+        max_pool_dollars = max(curr_eq, 1000.0) * pool_fraction
+        stop_dist = max(abs(ep - slp), ep * 0.005, 0.01)
         raw_shares = min(risk_budget / stop_dist, max_pool_dollars / max(ep, 0.01))
+        if math.isnan(raw_shares) or math.isinf(raw_shares):
+            raw_shares = 1.0
         shares_int = max(1, int(round(raw_shares)))
         actual_risk = shares_int * abs(ep - slp)
         return shares_int, actual_risk
@@ -723,8 +726,8 @@ def run_strategy_backtest(
         ts = timestamps[i]
         c_high, c_low, c_close, c_open = highs[i], lows[i], closes[i], opens[i]
         unit_vol = gks[i] if vol_model == "gk" else atrs[i]
-        if np.isnan(unit_vol) or unit_vol <= 0:
-            unit_vol = c_close * 0.015
+        if np.isnan(unit_vol) or math.isinf(unit_vol) or unit_vol <= 0:
+            unit_vol = max(c_close * 0.015, 0.01)
 
         trend_long, trend_short = False, False
         trig_long, trig_short = False, False
@@ -760,7 +763,7 @@ def run_strategy_backtest(
             trig_short = trend_short and (c_high >= fib_382[i] * 0.995) and (c_close <= fib_382[i]) and (rsi[i] > 40)
 
         elif strategy_key == "orb":
-            if not np.isnan(orb_high[i]):
+            if not np.isnan(orb_high[i]) and not np.isnan(orb_low[i]):
                 trend_long = c_close > orb_mid[i] and c_close > vwap[i]
                 trig_long = (closes[i - 1] <= orb_high[i - 1]) and (c_close > orb_high[i]) and (rvol[i] >= 1.2)
 
@@ -801,25 +804,26 @@ def run_strategy_backtest(
         if not allow_short:
             trend_short, trig_short = False, False
 
-        # ---------------- STATE MACHINE ----------------
         if state == 0:
             if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
                 is_long = trig_long
                 state = 2 if is_long else -2
                 entry_price = c_close
                 entry_idx = i
+                safe_atr = _clean_float(atrs[i], c_close * 0.015)
+                safe_gk = _clean_float(gks[i], safe_atr)
                 if is_long:
-                    sl_price = entry_price - sl_mult * atrs[i]
-                    tp_price = entry_price + tp_mult * atrs[i]
-                    alt_sl_price = entry_price - sl_mult * gks[i]
-                    alt_tp_price = entry_price + tp_mult * gks[i]
+                    sl_price = entry_price - sl_mult * safe_atr
+                    tp_price = entry_price + tp_mult * safe_atr
+                    alt_sl_price = entry_price - sl_mult * safe_gk
+                    alt_tp_price = entry_price + tp_mult * safe_gk
                 else:
-                    sl_price = entry_price + sl_mult * atrs[i]
-                    tp_price = entry_price - tp_mult * atrs[i]
-                    alt_sl_price = entry_price + sl_mult * gks[i]
-                    alt_tp_price = entry_price - tp_mult * gks[i]
+                    sl_price = entry_price + sl_mult * safe_atr
+                    tp_price = entry_price - tp_mult * safe_atr
+                    alt_sl_price = entry_price + sl_mult * safe_gk
+                    alt_tp_price = entry_price - tp_mult * safe_gk
                 position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_Signal_reason = "MANUAL_CLICK"
+                entry_signal_reason = "MANUAL_CLICK"
                 markers.append({
                     "time": ts,
                     "position": "belowBar" if is_long else "aboveBar",
@@ -845,21 +849,22 @@ def run_strategy_backtest(
                 state = 2
                 entry_price = c_close
                 entry_idx = i
+                safe_gk = _clean_float(gks[i], unit_vol)
                 if strategy_key == "do_t":
                     sl_price = entry_price - (0.85 * unit_vol)
-                    tp_price = max(vwap[i], entry_price + 0.8 * unit_vol)
+                    tp_price = max(_clean_float(vwap[i], entry_price), entry_price + 0.8 * unit_vol)
                 elif strategy_key == "orb" and not np.isnan(orb_mid[i]):
-                    sl_price = min(orb_mid[i], entry_price - 0.5 * unit_vol)
+                    sl_price = min(float(orb_mid[i]), entry_price - 0.5 * unit_vol)
                     tp_price = entry_price + tp_mult * max(entry_price - sl_price, 0.5 * unit_vol)
                 else:
                     sl_price = entry_price - sl_mult * unit_vol
                     tp_price = entry_price + tp_mult * unit_vol
 
-                alt_sl_price = entry_price - sl_mult * gks[i]
-                alt_tp_price = entry_price + tp_mult * gks[i]
+                alt_sl_price = entry_price - sl_mult * safe_gk
+                alt_tp_price = entry_price + tp_mult * safe_gk
 
                 position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_Signal_reason = "RE-ENTRY LONG" if is_re else "INITIAL LONG"
+                entry_signal_reason = "RE-ENTRY LONG" if is_re else "INITIAL LONG"
 
                 markers.append({
                     "time": ts, "position": "belowBar",
@@ -877,21 +882,22 @@ def run_strategy_backtest(
                 state = -2
                 entry_price = c_close
                 entry_idx = i
+                safe_gk = _clean_float(gks[i], unit_vol)
                 if strategy_key == "do_t":
                     sl_price = entry_price + (0.85 * unit_vol)
-                    tp_price = min(vwap[i], entry_price - 0.8 * unit_vol)
+                    tp_price = min(_clean_float(vwap[i], entry_price), entry_price - 0.8 * unit_vol)
                 elif strategy_key == "orb" and not np.isnan(orb_mid[i]):
-                    sl_price = max(orb_mid[i], entry_price + 0.5 * unit_vol)
+                    sl_price = max(float(orb_mid[i]), entry_price + 0.5 * unit_vol)
                     tp_price = entry_price - tp_mult * max(sl_price - entry_price, 0.5 * unit_vol)
                 else:
                     sl_price = entry_price + sl_mult * unit_vol
                     tp_price = entry_price - tp_mult * unit_vol
 
-                alt_sl_price = entry_price + sl_mult * gks[i]
-                alt_tp_price = entry_price - tp_mult * gks[i]
+                alt_sl_price = entry_price + sl_mult * safe_gk
+                alt_tp_price = entry_price - tp_mult * safe_gk
 
                 position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_Signal_reason = "RE-ENTRY SHORT" if is_re else "INITIAL SHORT"
+                entry_signal_reason = "RE-ENTRY SHORT" if is_re else "INITIAL SHORT"
 
                 markers.append({
                     "time": ts, "position": "aboveBar",
@@ -906,7 +912,7 @@ def run_strategy_backtest(
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 pnl = (exit_price - entry_price) * position_shares
-                ret_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                ret_pct = ((exit_price - entry_price) / max(entry_price, 1e-6)) * 100.0
                 pos_val = entry_price * position_shares
                 alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
                 equity += pnl
@@ -914,31 +920,31 @@ def run_strategy_backtest(
                 trades.append({
                     "trade_no": len(trades) + 1,
                     "side": "LONG",
-                    "signal_type": entry_Signal_reason,
+                    "signal_type": entry_signal_reason,
                     "pool": pool_label,
                     "entry_time": timestamps[entry_idx],
                     "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
                     "exit_dt": _fmt_dt(dt_index[i], tf),
                     "type": "TP" if hit_tp else "SL",
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(exit_price, 2),
-                    "sl_price": round(sl_price, 2),
-                    "tp_price": round(tp_price, 2),
+                    "entry_price": _clean_float(entry_price, 0.0, 2),
+                    "exit_price": _clean_float(exit_price, 0.0, 2),
+                    "sl_price": _clean_float(sl_price, 0.0, 2),
+                    "tp_price": _clean_float(tp_price, 0.0, 2),
                     "shares": int(position_shares),
-                    "position_value": round(pos_val, 2),
-                    "alloc_pct": round(alloc_pct, 1),
-                    "dollar_risk": round(dollar_risk_at_entry, 2),
-                    "bar_volume": int(volumes[entry_idx]),
-                    "bar_rvol": round(float(rvol[entry_idx]), 2),
-                    "pnl": round(pnl, 2),
-                    "ret_pct": round(ret_pct, 2),
-                    "equity_after": round(equity, 2)
+                    "position_value": _clean_float(pos_val, 0.0, 2),
+                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+                    "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+                    "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+                    "pnl": _clean_float(pnl, 0.0, 2),
+                    "ret_pct": _clean_float(ret_pct, 0.0, 2),
+                    "equity_after": _clean_float(equity, initial_capital, 2)
                 })
                 boxes.append({
                     "side": "LONG", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": float(entry_price), "tp": float(tp_price), "sl": float(sl_price),
-                    "alt_tp": float(alt_tp_price), "alt_sl": float(alt_sl_price),
+                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(sl_price),
+                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price),
                     "outcome": "TP" if hit_tp else "SL"
                 })
                 if hit_tp:
@@ -956,7 +962,7 @@ def run_strategy_backtest(
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 pnl = (entry_price - exit_price) * position_shares
-                ret_pct = ((entry_price - exit_price) / entry_price) * 100.0
+                ret_pct = ((entry_price - exit_price) / max(entry_price, 1e-6)) * 100.0
                 pos_val = entry_price * position_shares
                 alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
                 equity += pnl
@@ -964,31 +970,31 @@ def run_strategy_backtest(
                 trades.append({
                     "trade_no": len(trades) + 1,
                     "side": "SHORT",
-                    "signal_type": entry_Signal_reason,
+                    "signal_type": entry_signal_reason,
                     "pool": pool_label,
                     "entry_time": timestamps[entry_idx],
                     "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
                     "exit_dt": _fmt_dt(dt_index[i], tf),
                     "type": "TP" if hit_tp else "SL",
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(exit_price, 2),
-                    "sl_price": round(sl_price, 2),
-                    "tp_price": round(tp_price, 2),
+                    "entry_price": _clean_float(entry_price, 0.0, 2),
+                    "exit_price": _clean_float(exit_price, 0.0, 2),
+                    "sl_price": _clean_float(sl_price, 0.0, 2),
+                    "tp_price": _clean_float(tp_price, 0.0, 2),
                     "shares": int(position_shares),
-                    "position_value": round(pos_val, 2),
-                    "alloc_pct": round(alloc_pct, 1),
-                    "dollar_risk": round(dollar_risk_at_entry, 2),
-                    "bar_volume": int(volumes[entry_idx]),
-                    "bar_rvol": round(float(rvol[entry_idx]), 2),
-                    "pnl": round(pnl, 2),
-                    "ret_pct": round(ret_pct, 2),
-                    "equity_after": round(equity, 2)
+                    "position_value": _clean_float(pos_val, 0.0, 2),
+                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+                    "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+                    "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+                    "pnl": _clean_float(pnl, 0.0, 2),
+                    "ret_pct": _clean_float(ret_pct, 0.0, 2),
+                    "equity_after": _clean_float(equity, initial_capital, 2)
                 })
                 boxes.append({
                     "side": "SHORT", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": float(entry_price), "tp": float(tp_price), "sl": float(sl_price),
-                    "alt_tp": float(alt_tp_price), "alt_sl": float(alt_sl_price),
+                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(sl_price),
+                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price),
                     "outcome": "TP" if hit_tp else "SL"
                 })
                 if hit_tp:
@@ -1001,53 +1007,52 @@ def run_strategy_backtest(
                     watch_trough = c_low
 
         peak_equity = max(peak_equity, equity)
-        dd = ((peak_equity - equity) / peak_equity) * 100.0
+        dd = ((peak_equity - equity) / max(peak_equity, 1.0)) * 100.0
         max_dd_pct = max(max_dd_pct, dd)
-        equity_curve.append({"time": ts, "value": round(equity, 2)})
+        equity_curve.append({"time": ts, "value": _clean_float(equity, initial_capital, 2)})
 
-    # If a position is still open on the latest candle, include it in the trade log as OPEN
     if state in [2, -2] and n > 0:
         is_long_open = (state == 2)
         last_c = closes[-1]
         unreal_pnl = ((last_c - entry_price) if is_long_open else (entry_price - last_c)) * position_shares
-        unreal_pct = (((last_c - entry_price) if is_long_open else (entry_price - last_c)) / entry_price) * 100.0
+        unreal_pct = (((last_c - entry_price) if is_long_open else (entry_price - last_c)) / max(entry_price, 1e-6)) * 100.0
         pos_val = entry_price * position_shares
         alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
 
         trades.append({
             "trade_no": len(trades) + 1,
             "side": "LONG" if is_long_open else "SHORT",
-            "signal_type": entry_Signal_reason,
+            "signal_type": entry_signal_reason,
             "pool": pool_label,
             "entry_time": timestamps[entry_idx],
             "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
             "exit_time": timestamps[-1],
             "exit_dt": "OPEN (Active)",
             "type": "OPEN",
-            "entry_price": round(entry_price, 2),
-            "exit_price": round(float(last_c), 2),
-            "sl_price": round(sl_price, 2),
-            "tp_price": round(tp_price, 2),
+            "entry_price": _clean_float(entry_price, 0.0, 2),
+            "exit_price": _clean_float(last_c, 0.0, 2),
+            "sl_price": _clean_float(sl_price, 0.0, 2),
+            "tp_price": _clean_float(tp_price, 0.0, 2),
             "shares": int(position_shares),
-            "position_value": round(pos_val, 2),
-            "alloc_pct": round(alloc_pct, 1),
-            "dollar_risk": round(dollar_risk_at_entry, 2),
-            "bar_volume": int(volumes[entry_idx]),
-            "bar_rvol": round(float(rvol[entry_idx]), 2),
-            "pnl": round(unreal_pnl, 2),
-            "ret_pct": round(unreal_pct, 2),
-            "equity_after": round(equity + unreal_pnl, 2)
+            "position_value": _clean_float(pos_val, 0.0, 2),
+            "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+            "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+            "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+            "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+            "pnl": _clean_float(unreal_pnl, 0.0, 2),
+            "ret_pct": _clean_float(unreal_pct, 0.0, 2),
+            "equity_after": _clean_float(equity + unreal_pnl, initial_capital, 2)
         })
 
         boxes.append({
             "side": "LONG" if is_long_open else "SHORT",
             "t1": timestamps[entry_idx],
             "t2": timestamps[-1],
-            "entry": float(entry_price),
-            "tp": float(tp_price),
-            "sl": float(sl_price),
-            "alt_tp": float(alt_tp_price),
-            "alt_sl": float(alt_sl_price),
+            "entry": _clean_float(entry_price),
+            "tp": _clean_float(tp_price),
+            "sl": _clean_float(sl_price),
+            "alt_tp": _clean_float(alt_tp_price),
+            "alt_sl": _clean_float(alt_sl_price),
             "outcome": "ACTIVE"
         })
 
@@ -1061,24 +1066,24 @@ def run_strategy_backtest(
     gross_profit = sum(t['pnl'] for t in wins)
     gross_loss = abs(sum(t['pnl'] for t in losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
-    net_return_pct = ((equity - initial_capital) / initial_capital) * 100.0
-    buy_hold_ret = ((closes[-1] - closes[0]) / closes[0]) * 100.0 if n > 1 else 0.0
+    net_return_pct = ((equity - initial_capital) / max(initial_capital, 1.0)) * 100.0
+    buy_hold_ret = ((closes[-1] - closes[0]) / max(closes[0], 1e-6)) * 100.0 if n > 1 else 0.0
 
     stats = {
         "strategy_key": strategy_key,
         "strategy_name": STRATEGY_METADATA[strategy_key]["name"],
         "bucket": STRATEGY_METADATA[strategy_key]["bucket"],
-        "initial_capital": initial_capital,
-        "ending_equity": round(equity, 2),
-        "net_pnl": round(equity - initial_capital, 2),
-        "net_return_pct": round(net_return_pct, 2),
-        "buy_hold_pct": round(buy_hold_ret, 2),
+        "initial_capital": _clean_float(initial_capital, 100000.0, 2),
+        "ending_equity": _clean_float(equity, initial_capital, 2),
+        "net_pnl": _clean_float(equity - initial_capital, 0.0, 2),
+        "net_return_pct": _clean_float(net_return_pct, 0.0, 2),
+        "buy_hold_pct": _clean_float(buy_hold_ret, 0.0, 2),
         "total_trades": total_trades,
         "long_trades": long_trades,
         "short_trades": short_trades,
-        "win_rate_pct": round(win_rate, 1),
-        "profit_factor": round(min(profit_factor, 99.9), 2),
-        "max_dd_pct": round(max_dd_pct, 2)
+        "win_rate_pct": _clean_float(win_rate, 0.0, 1),
+        "profit_factor": _clean_float(min(profit_factor, 99.9), 0.0, 2),
+        "max_dd_pct": _clean_float(max_dd_pct, 0.0, 2)
     }
 
     return {
@@ -1096,13 +1101,16 @@ def run_strategy_backtest(
 def black_scholes_analysis(
     S: float, K: float, days_to_expiry: int, iv_pct: float, r_pct: float, gk_daily_vol_pct: float, opt_type: str = "call"
 ) -> Dict[str, Any]:
-    T = max(days_to_expiry / 365.0, 1 / 3650.0)
-    sigma = max(iv_pct / 100.0, 0.01)
-    r = r_pct / 100.0
+    S = max(_clean_float(S, 100.0), 0.01)
+    K = max(_clean_float(K, 100.0), 0.01)
+    T = max(_clean_float(days_to_expiry, 14) / 365.0, 1 / 3650.0)
+    sigma = max(_clean_float(iv_pct, 50.0) / 100.0, 0.01)
+    r = _clean_float(r_pct, 4.25) / 100.0
+    gk_daily = max(_clean_float(gk_daily_vol_pct, 2.0), 0.1)
 
-    hv_annual = gk_daily_vol_pct * math.sqrt(252)
+    hv_annual = (gk_daily / 100.0) * math.sqrt(252)
 
-    d1 = (math.log(S / max(K, 0.01)) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
 
     if opt_type == "call":
@@ -1132,20 +1140,20 @@ def black_scholes_analysis(
     else:
         verdict = "FAIRLY PRICED (IV aligned with Garman-Klass HV)"
 
-    return {
-        "theo_price": round(price, 3),
-        "delta": round(delta, 3),
-        "gamma": round(gamma, 4),
-        "theta_daily": round(theta, 3),
-        "vega_per_1pct": round(vega, 3),
-        "prob_itm_pct": round(prob_itm, 1),
-        "breakeven": round(breakeven, 2),
-        "hv_annual_pct": round(hv_annual * 100.0, 1),
-        "iv_hv_ratio": round(iv_hv_ratio, 2),
-        "expected_move_iv": round(expected_move_iv_dollar, 2),
-        "expected_move_hv": round(expected_move_hv_dollar, 2),
+    return _sanitize_for_json({
+        "theo_price": _clean_float(price, 0.01, 3),
+        "delta": _clean_float(delta, 0.0, 3),
+        "gamma": _clean_float(gamma, 0.0, 4),
+        "theta_daily": _clean_float(theta, 0.0, 3),
+        "vega_per_1pct": _clean_float(vega, 0.0, 3),
+        "prob_itm_pct": _clean_float(prob_itm, 0.0, 1),
+        "breakeven": _clean_float(breakeven, S, 2),
+        "hv_annual_pct": _clean_float(hv_annual * 100.0, 20.0, 1),
+        "iv_hv_ratio": _clean_float(iv_hv_ratio, 1.0, 2),
+        "expected_move_iv": _clean_float(expected_move_iv_dollar, 1.0, 2),
+        "expected_move_hv": _clean_float(expected_move_hv_dollar, 1.0, 2),
         "verdict": verdict
-    }
+    })
 
 
 @app.get("/api/option_chain")
@@ -1156,6 +1164,9 @@ def api_option_chain(
     gk_daily_vol_pct: float = Query(2.5)
 ):
     ticker = ticker.upper().strip()
+    spot = max(_clean_float(spot, 100.0), 1.0)
+    gk_daily_vol_pct = max(_clean_float(gk_daily_vol_pct, 2.5), 0.2)
+
     try:
         tk = yf.Ticker(ticker)
         expirations = list(tk.options)
@@ -1170,30 +1181,31 @@ def api_option_chain(
                 df_sub = df_sub.sort_values("dist").head(12).sort_values("strike")
                 rows = []
                 for _, r in df_sub.iterrows():
-                    iv_val = float(r.get("impliedVolatility", 0.5)) * 100.0
-                    bs = black_scholes_analysis(spot, float(r["strike"]), dte, max(iv_val, 5.0), 4.25, gk_daily_vol_pct, opt_type)
+                    strike_v = _clean_float(r.get("strike"), spot, 2)
+                    iv_val = _clean_float(r.get("impliedVolatility"), 0.5) * 100.0
+                    bs = black_scholes_analysis(spot, strike_v, dte, max(iv_val, 5.0), 4.25, gk_daily_vol_pct, opt_type)
                     rows.append({
                         "contractSymbol": str(r.get("contractSymbol", "")),
-                        "strike": float(r["strike"]),
-                        "lastPrice": round(float(r.get("lastPrice", 0.0)), 2),
-                        "bid": round(float(r.get("bid", 0.0)), 2),
-                        "ask": round(float(r.get("ask", 0.0)), 2),
-                        "iv_pct": round(iv_val, 1),
-                        "volume": int(r.get("volume", 0) if not pd.isna(r.get("volume")) else 0),
-                        "openInterest": int(r.get("openInterest", 0) if not pd.isna(r.get("openInterest")) else 0),
+                        "strike": strike_v,
+                        "lastPrice": _clean_float(r.get("lastPrice"), bs["theo_price"], 2),
+                        "bid": _clean_float(r.get("bid"), 0.0, 2),
+                        "ask": _clean_float(r.get("ask"), 0.0, 2),
+                        "iv_pct": _clean_float(iv_val, 50.0, 1),
+                        "volume": int(_clean_float(r.get("volume"), 0)),
+                        "openInterest": int(_clean_float(r.get("openInterest"), 0)),
                         "delta": bs["delta"],
                         "theta": bs["theta_daily"],
                         "verdict": "CHEAP" if bs["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs["iv_hv_ratio"] > 1.25 else "FAIR")
                     })
                 return rows
 
-            return {
+            return _sanitize_for_json({
                 "source": "Yahoo Finance Live Option Chain",
                 "expirations": expirations,
                 "selected_expiry": sel_exp,
                 "calls": format_side(chain.calls, "call"),
                 "puts": format_side(chain.puts, "put")
-            }
+            })
     except Exception:
         pass
 
@@ -1205,7 +1217,7 @@ def api_option_chain(
     ]
     sel_exp = expiry if (expiry in exp_dates) else exp_dates[1]
     dte = max(1, (datetime.strptime(sel_exp, "%Y-%m-%d") - datetime.now()).days)
-    hv_ann = max(gk_daily_vol_pct * math.sqrt(252), 25.0)
+    hv_ann = max((gk_daily_vol_pct / 100.0) * math.sqrt(252) * 100.0, 25.0)
     step = max(1.0, round(spot * 0.025, 0))
     base_strike = round(spot / step) * step
 
@@ -1223,30 +1235,32 @@ def api_option_chain(
 
         calls.append({
             "contractSymbol": c_sym, "strike": k,
-            "lastPrice": round(bs_c["theo_price"], 2),
-            "bid": round(max(0.01, bs_c["theo_price"] * 0.96), 2),
-            "ask": round(bs_c["theo_price"] * 1.04, 2),
-            "iv_pct": round(skew_iv, 1), "volume": 120 * (6 - abs(k_idx)), "openInterest": 850 * (6 - abs(k_idx)),
+            "lastPrice": _clean_float(bs_c["theo_price"], 0.01, 2),
+            "bid": _clean_float(max(0.01, bs_c["theo_price"] * 0.96), 0.01, 2),
+            "ask": _clean_float(bs_c["theo_price"] * 1.04, 0.02, 2),
+            "iv_pct": _clean_float(skew_iv, 50.0, 1),
+            "volume": 120 * (6 - abs(k_idx)), "openInterest": 850 * (6 - abs(k_idx)),
             "delta": bs_c["delta"], "theta": bs_c["theta_daily"],
             "verdict": "CHEAP" if bs_c["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_c["iv_hv_ratio"] > 1.25 else "FAIR")
         })
         puts.append({
             "contractSymbol": p_sym, "strike": k,
-            "lastPrice": round(bs_p["theo_price"], 2),
-            "bid": round(max(0.01, bs_p["theo_price"] * 0.96), 2),
-            "ask": round(bs_p["theo_price"] * 1.04, 2),
-            "iv_pct": round(skew_iv, 1), "volume": 95 * (6 - abs(k_idx)), "openInterest": 720 * (6 - abs(k_idx)),
+            "lastPrice": _clean_float(bs_p["theo_price"], 0.01, 2),
+            "bid": _clean_float(max(0.01, bs_p["theo_price"] * 0.96), 0.01, 2),
+            "ask": _clean_float(bs_p["theo_price"] * 1.04, 0.02, 2),
+            "iv_pct": _clean_float(skew_iv, 50.0, 1),
+            "volume": 95 * (6 - abs(k_idx)), "openInterest": 720 * (6 - abs(k_idx)),
             "delta": bs_p["delta"], "theta": bs_p["theta_daily"],
             "verdict": "CHEAP" if bs_p["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_p["iv_hv_ratio"] > 1.25 else "FAIR")
         })
 
-    return {
-        "source": "BSM + Garman-Klass Live Reconstructed Chain (Yahoo Option Rate-Limit Bypassed)",
+    return _sanitize_for_json({
+        "source": "BSM + Garman-Klass Live Reconstructed Chain",
         "expirations": exp_dates,
         "selected_expiry": sel_exp,
         "calls": calls,
         "puts": puts
-    }
+    })
 
 
 @app.get("/api/option_contract_history")
@@ -1265,14 +1279,14 @@ def api_option_contract_history(
             bars = [
                 {
                     "date": dt.strftime("%Y-%m-%d"),
-                    "close": round(float(r["Close"]), 2),
-                    "high": round(float(r["High"]), 2),
-                    "low": round(float(r["Low"]), 2),
-                    "volume": int(r.get("Volume", 0))
+                    "close": _clean_float(r["Close"], 0.01, 2),
+                    "high": _clean_float(r["High"], 0.01, 2),
+                    "low": _clean_float(r["Low"], 0.01, 2),
+                    "volume": int(_clean_float(r.get("Volume", 0), 0))
                 }
                 for dt, r in df_opt.tail(60).iterrows()
             ]
-            return {"contract": contract_symbol, "source": "Yahoo Finance Contract History", "bars": bars}
+            return _sanitize_for_json({"contract": contract_symbol, "source": "Yahoo Finance Contract History", "bars": bars})
     except Exception:
         pass
 
@@ -1285,16 +1299,16 @@ def api_option_contract_history(
         bs = black_scholes_analysis(float(r["close"]), strike, rem_dte, iv_pct, 4.25, 2.5, opt_type)
         bars.append({
             "date": dt.strftime("%Y-%m-%d"),
-            "close": round(bs["theo_price"], 2),
-            "high": round(bs["theo_price"] * 1.08, 2),
-            "low": round(max(0.01, bs["theo_price"] * 0.92), 2),
-            "volume": int(max(10, float(r["volume"]) / 5000))
+            "close": _clean_float(bs["theo_price"], 0.01, 2),
+            "high": _clean_float(bs["theo_price"] * 1.08, 0.01, 2),
+            "low": _clean_float(max(0.01, bs["theo_price"] * 0.92), 0.01, 2),
+            "volume": int(max(10, _clean_float(r["volume"], 1000) / 5000))
         })
-    return {
+    return _sanitize_for_json({
         "contract": contract_symbol,
         "source": "Historical Black-Scholes Reconstructed Curve (Underlying-Linked)",
         "bars": bars
-    }
+    })
 
 
 # ==============================================================================
@@ -1400,7 +1414,7 @@ def api_analyze(
 
     candles = []
     volumes = []
-    bar_details = {}  # Fast O(1) lookup by timestamp for the Floating Hover HUD
+    bar_details = {}
     series_data = {
         "ema20": [], "ema50": [], "vwap": [], "vwap_u2": [], "vwap_l2": [],
         "atr_upper": [], "atr_lower": [], "gk_upper": [], "gk_lower": [],
@@ -1420,24 +1434,24 @@ def api_analyze(
 
     for i, (dt, row) in enumerate(df_view.iterrows()):
         ts = idx_timestamps[i]
-        o_val = round(float(row['open']), 4)
-        h_val = round(float(row['high']), 4)
-        l_val = round(float(row['low']), 4)
-        c_val = round(float(row['close']), 4)
-        v_val = float(row['volume'])
-        atr_val = float(row['atr'])
-        gk_val = float(row['gk_sigma_dollar'])
+        o_val = _clean_float(row['open'], 0.0, 4)
+        h_val = _clean_float(row['high'], 0.0, 4)
+        l_val = _clean_float(row['low'], 0.0, 4)
+        c_val = _clean_float(row['close'], 0.0, 4)
+        v_val = _clean_float(row['volume'], 0.0)
+        atr_val = _clean_float(row['atr'], max(c_val * 0.015, 0.01))
+        gk_val = _clean_float(row['gk_sigma_dollar'], atr_val)
         unit_v = gk_val if vol_model == "gk" else atr_val
-        if np.isnan(unit_v) or unit_v <= 0:
-            unit_v = c_val * 0.015
+        if unit_v <= 0:
+            unit_v = max(c_val * 0.015, 0.01)
 
-        # Precompute Position Sizing if entering on this exact bar
-        stop_dist = max(sl_mult * unit_v, c_val * 0.005)
+        stop_dist = max(sl_mult * unit_v, c_val * 0.005, 0.01)
         risk_dollars = initial_capital * risk_frac
         max_pool_dollars = initial_capital * pool_frac
-        sug_shares = max(1, int(round(min(risk_dollars / stop_dist, max_pool_dollars / max(c_val, 0.01)))))
-        sug_pos_val = round(sug_shares * c_val, 2)
-        sug_risk_dlr = round(sug_shares * stop_dist, 2)
+        raw_sh = min(risk_dollars / stop_dist, max_pool_dollars / max(c_val, 0.01))
+        sug_shares = max(1, int(round(_clean_float(raw_sh, 1.0))))
+        sug_pos_val = _clean_float(sug_shares * c_val, 0.0, 2)
+        sug_risk_dlr = _clean_float(sug_shares * stop_dist, 0.0, 2)
 
         candles.append({"time": ts, "open": o_val, "high": h_val, "low": l_val, "close": c_val})
         volumes.append({
@@ -1449,51 +1463,57 @@ def api_analyze(
         chg_pct = ((c_val - o_val) / max(o_val, 1e-6)) * 100.0
         bar_details[str(ts)] = {
             "dt": _fmt_dt(dt, tf),
-            "o": round(o_val, 2),
-            "h": round(h_val, 2),
-            "l": round(l_val, 2),
-            "c": round(c_val, 2),
-            "chg_pct": round(chg_pct, 2),
+            "o": _clean_float(o_val, 0.0, 2),
+            "h": _clean_float(h_val, 0.0, 2),
+            "l": _clean_float(l_val, 0.0, 2),
+            "c": _clean_float(c_val, 0.0, 2),
+            "chg_pct": _clean_float(chg_pct, 0.0, 2),
             "vol": int(v_val),
-            "rvol": round(float(row['rvol']), 2),
-            "ema20": round(float(row['ema20']), 2),
-            "ema50": round(float(row['ema50']), 2),
-            "vwap": round(float(row['vwap']), 2),
-            "rsi": round(float(row['rsi']), 1),
-            "atr": round(atr_val, 2),
-            "gk_pct": round(float(row['gk_vol_pct']) * 100.0, 2),
-            "score": round(float(row['composite_score']), 2),
+            "rvol": _clean_float(row['rvol'], 1.0, 2),
+            "ema20": _clean_float(row['ema20'], c_val, 2),
+            "ema50": _clean_float(row['ema50'], c_val, 2),
+            "vwap": _clean_float(row['vwap'], c_val, 2),
+            "rsi": _clean_float(row['rsi'], 50.0, 1),
+            "atr": _clean_float(atr_val, 0.0, 2),
+            "gk_pct": _clean_float(float(row['gk_vol_pct']) * 100.0, 2.0, 2),
+            "score": _clean_float(row['composite_score'], 0.0, 2),
             "regime": "UNCLEAR / VOLATILE" if bool(row['is_unclear_volatile']) else (
-                "BULL TREND" if row['ema20'] > row['ema50'] else "BEAR TREND"
+                "BULL TREND" if _clean_float(row['ema20']) >= _clean_float(row['ema50']) else "BEAR TREND"
             ),
             "sug_shares": sug_shares,
             "sug_pos_val": sug_pos_val,
             "sug_risk": sug_risk_dlr,
-            "long_sl": round(c_val - stop_dist, 2),
-            "long_tp": round(c_val + tp_mult * unit_v, 2),
-            "short_sl": round(c_val + stop_dist, 2),
-            "short_tp": round(c_val - tp_mult * unit_v, 2)
+            "long_sl": _clean_float(c_val - stop_dist, 0.0, 2),
+            "long_tp": _clean_float(c_val + tp_mult * unit_v, 0.0, 2),
+            "short_sl": _clean_float(c_val + stop_dist, 0.0, 2),
+            "short_tp": _clean_float(c_val - tp_mult * unit_v, 0.0, 2)
         }
 
         for col in series_data.keys():
             val = row.get(col, np.nan)
-            if not np.isnan(val):
+            if not pd.isna(val) and not math.isinf(float(val)):
                 series_data[col].append({"time": ts, "value": round(float(val), 4)})
 
-        if row['fvg_bull'] and i >= 2:
-            t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
-            fvg_boxes.append({
-                "t1": idx_timestamps[i - 2], "t2": t_end,
-                "top": float(row['fvg_bull_top']), "bot": float(row['fvg_bull_bot']),
-                "kind": "BULL_FVG"
-            })
-        if row['fvg_bear'] and i >= 2:
-            t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
-            fvg_boxes.append({
-                "t1": idx_timestamps[i - 2], "t2": t_end,
-                "top": float(row['fvg_bear_top']), "bot": float(row['fvg_bear_bot']),
-                "kind": "BEAR_FVG"
-            })
+        if bool(row['fvg_bull']) and i >= 2:
+            top_v = row['fvg_bull_top']
+            bot_v = row['fvg_bull_bot']
+            if not pd.isna(top_v) and not pd.isna(bot_v):
+                t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
+                fvg_boxes.append({
+                    "t1": idx_timestamps[i - 2], "t2": t_end,
+                    "top": _clean_float(top_v), "bot": _clean_float(bot_v),
+                    "kind": "BULL_FVG"
+                })
+        if bool(row['fvg_bear']) and i >= 2:
+            top_v = row['fvg_bear_top']
+            bot_v = row['fvg_bear_bot']
+            if not pd.isna(top_v) and not pd.isna(bot_v):
+                t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
+                fvg_boxes.append({
+                    "t1": idx_timestamps[i - 2], "t2": t_end,
+                    "top": _clean_float(top_v), "bot": _clean_float(bot_v),
+                    "kind": "BEAR_FVG"
+                })
 
         is_unc = bool(row['is_unclear_volatile'])
         if is_unc and not in_unclear:
@@ -1507,11 +1527,11 @@ def api_analyze(
         unclear_spans.append({"t1": unclear_start, "t2": idx_timestamps[-1]})
 
     last_row = df_view.iloc[-1]
-    last_close = float(last_row['close'])
-    last_atr = float(last_row['atr'])
-    last_gk_pct = float(last_row['gk_vol_pct'])
+    last_close = _clean_float(last_row['close'], 100.0, 2)
+    last_atr = _clean_float(last_row['atr'], 1.5, 2)
+    last_gk_pct = _clean_float(float(last_row['gk_vol_pct']) * 100.0, 2.5, 2)
 
-    return {
+    payload = {
         "ticker": ticker.upper(),
         "tf": tf,
         "total_bars": len(candles),
@@ -1530,12 +1550,13 @@ def api_analyze(
         "backtest": bt_selected,
         "all_strategies_summary": all_summary,
         "latest_metrics": {
-            "close": round(last_close, 2),
-            "atr": round(last_atr, 2),
-            "gk_daily_vol_pct": round(last_gk_pct * 100.0, 2),
-            "composite_score": round(float(last_row['composite_score']), 2)
+            "close": last_close,
+            "atr": last_atr,
+            "gk_daily_vol_pct": last_gk_pct,
+            "composite_score": _clean_float(last_row['composite_score'], 0.0, 2)
         }
     }
+    return JSONResponse(content=_sanitize_for_json(payload))
 
 
 @app.get("/api/options_greeks")
@@ -1579,7 +1600,6 @@ HTML_PAGE = r"""
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; font-size: 13px; }
   
-  /* Left Foldable Sidebar */
   .sidebar {
     width: 340px; background: var(--panel); border-right: 1px solid var(--border);
     overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px;
@@ -1587,7 +1607,6 @@ HTML_PAGE = r"""
   }
   .sidebar.collapsed { width: 0; padding: 0; border-right: none; overflow: hidden; }
 
-  /* Collapsible Accordion Cards */
   details.fold-card {
     background: #1a1f2e; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
   }
@@ -1634,7 +1653,6 @@ HTML_PAGE = r"""
   }
   .toggle-btn:hover { background: #323950; }
 
-  /* Deletable Breadcrumb Tabs */
   .breadcrumbs { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .crumb {
     background: #1e2433; border: 1px solid #363c4e; color: var(--text);
@@ -1664,7 +1682,6 @@ HTML_PAGE = r"""
     color: #ffb74d; padding: 5px 14px; font-size: 11.5px; display: none; flex-shrink: 0;
   }
 
-  /* Dynamic Chart Area */
   .chart-wrapper {
     position: relative; width: 100%; flex: 1; min-height: 440px;
     background: #0b0e14; border-bottom: 1px solid var(--border);
@@ -1676,7 +1693,6 @@ HTML_PAGE = r"""
     padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45;
   }
 
-  /* Floating Crosshair Bar Inspector & Position Sizing HUD */
   .floating-hud {
     position: absolute; top: 10px; right: 72px; z-index: 25;
     width: 300px; background: rgba(15, 19, 28, 0.94);
@@ -1694,7 +1710,6 @@ HTML_PAGE = r"""
     color: #ffd600; font-size: 11px;
   }
 
-  /* Foldable Bottom Panels Container */
   .bottom-panels { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
   .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
@@ -1876,7 +1891,7 @@ HTML_PAGE = r"""
               <th>Entry $</th>
               <th>Shares to Buy/Short</th>
               <th>Position Value ($)</th>
-              <th> Dollar Risk ($)</th>
+              <th>Dollar Risk ($)</th>
               <th>SL / TP ($)</th>
               <th>Exit Time</th>
               <th>Exit $</th>
@@ -1979,7 +1994,6 @@ let chart, candleSeries, volumeSeries;
 let lineSeriesMap = {};
 let currentData = null;
 
-// Navigation & Deletable Tab State
 let currentTF = "1Y";
 let currentStartTs = null;
 let currentCutoffTs = null;
@@ -2061,7 +2075,6 @@ function initChart() {
   chart.timeScale().subscribeVisibleTimeRangeChange(() => requestAnimationFrame(drawCanvasZones));
   window.addEventListener('resize', resizeChart);
 
-  // Floating Hover Inspector HUD Subscription
   chart.subscribeCrosshairMove((param) => {
     const hud = document.getElementById('floating-hud');
     const showHud = document.getElementById('chk_hover_hud').checked;
@@ -2105,7 +2118,6 @@ function initChart() {
     `;
   });
 
-  // Candlestick Click Action
   chart.subscribeClick((param) => {
     if (!param || !param.time || !currentData) return;
     const clickedTs = param.time;
@@ -2215,8 +2227,6 @@ function deleteCrumb(idx) {
 }
 
 function switchTF(tf) {
-  // When user clicks a top-bar timeframe button directly, show MAX history for that timeframe
-  // unless they explicitly drilled down from a parent tab.
   currentTF = tf;
   if (activeCrumbIdx === 0) {
     currentStartTs = null;
@@ -2290,7 +2300,7 @@ async function loadChartData() {
   let msgs = [];
   if (data.warning) msgs.push(data.warning);
   if (data.unavailable_indicators && data.unavailable_indicators.length > 0) {
-    msgs.push("Hidden due to insufficient warm-up bars: " + data.unavailable_indicators.join(", "));
+    msgs.push("Note: " + data.unavailable_indicators.join(", "));
   }
   if (msgs.length > 0) {
     banner.style.display = 'block';
@@ -2455,7 +2465,6 @@ function updateTradeLogTable(data) {
     return;
   }
 
-  // Render newest trades at the top or chronological
   trades.forEach(t => {
     const tr = document.createElement('tr');
     tr.style.cursor = 'pointer';
