@@ -12,10 +12,10 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Long/Short Multi-Timeframe Backtest, SMC & Live Options Engine")
+app = FastAPI(title="Quant Lab: Max-Lookback Multi-Timeframe Backtest, SMC & Live Options Engine")
 
 # ==============================================================================
-# 1. DISK + MEMORY CACHE & MULTI-SOURCE FULL-HISTORY DATA ENGINE
+# 1. DISK + MEMORY CACHE & MAX-LOOKBACK MULTI-SOURCE DATA ENGINE
 # ==============================================================================
 DATA_CACHE: Dict[str, pd.DataFrame] = {}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_cache")
@@ -32,17 +32,16 @@ NEXT_TIMEFRAME = {
     "1m": "1m"
 }
 
+# Maximum allowed lookback days per Yahoo Finance server constraints
 YF_LIMIT_DAYS = {
-    "15m": 58,
-    "5m": 58,
-    "1m": 7
+    "15m": 60,
+    "5m": 60,
+    "1m": 28  # Fetched via stitched 7-day chunks
 }
 
 
 def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
-    """
-    Free, un-throttled fallback for ALL available Daily historical OHLCV data via Stooq.
-    """
+    """Free, un-throttled fallback for ALL available Daily historical OHLCV data via Stooq."""
     clean_t = ticker.upper().strip()
     url = f"https://stooq.com/q/d/l/?s={clean_t}.us&i=d"
     df = pd.read_csv(url)
@@ -57,9 +56,7 @@ def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
 
 
 def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
-    """
-    Secondary free fallback using Nasdaq's public chart API.
-    """
+    """Secondary free fallback using Nasdaq's public chart API."""
     clean_t = ticker.upper().strip()
     end_dt = datetime.now().strftime("%Y-%m-%d")
     start_dt = "1980-01-01"
@@ -96,10 +93,44 @@ def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
     raise RuntimeError(f"Nasdaq API returned no data for {ticker}")
 
 
+def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
+    """
+    Yahoo Finance allows up to ~30 days of 1-minute data, but only in 7-day request chunks.
+    This stitches 4 consecutive 7-day chunks together for the maximum possible 1m history.
+    """
+    t_obj = yf.Ticker(ticker)
+    chunks = []
+    now = datetime.now()
+    for w in range(4):
+        end_dt = now - timedelta(days=w * 7)
+        start_dt = now - timedelta(days=(w + 1) * 7)
+        try:
+            part = t_obj.history(start=start_dt, end=end_dt, interval="1m", auto_adjust=True)
+            if not part.empty:
+                part.index = pd.to_datetime(part.index).tz_localize(None)
+                part = part[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                part.columns = ['open', 'high', 'low', 'close', 'volume']
+                chunks.append(part)
+        except Exception:
+            continue
+
+    if chunks:
+        df_all = pd.concat(chunks).sort_index()
+        df_all = df_all[~df_all.index.duplicated(keep='first')]
+        return df_all
+
+    # Fallback to standard 7d period if chunking fails
+    df_7d = t_obj.history(period="7d", interval="1m", auto_adjust=True)
+    if not df_7d.empty:
+        df_7d.index = pd.to_datetime(df_7d.index).tz_localize(None)
+        df_7d = df_7d[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+        df_7d.columns = ['open', 'high', 'low', 'close', 'volume']
+        return df_7d
+    return pd.DataFrame()
+
+
 def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.DataFrame:
-    """
-    Reconstructs intraday bars anchored to real Daily OHLCV if Yahoo blocks intraday requests.
-    """
+    """Reconstructs intraday bars anchored to real Daily OHLCV if Yahoo blocks intraday requests."""
     daily_csv = os.path.join(CACHE_DIR, f"{ticker}_1d_max.csv")
     if os.path.exists(daily_csv):
         df_1d = pd.read_csv(daily_csv, index_col=0, parse_dates=True).tail(days)
@@ -152,26 +183,35 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
 
 def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[pd.DataFrame, Optional[str]]:
     """
-    Uses period='max' for 1d so every single historical trading day is included when constructing 1Y, 1M, 1W, 1d.
+    Fetches maximum allowed history for every timeframe:
+    - 1d: period='max' (all years since IPO)
+    - 15m / 5m: period='60d' (max allowed by Yahoo)
+    - 1m: stitched 4x7d chunks (~28-30 days max allowed by Yahoo)
     """
-    suffix = "max" if interval == "1d" else interval
-    csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_{suffix}.csv")
+    csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_max.csv")
 
     if os.path.exists(csv_path):
         try:
-            df_disk = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-            if not df_disk.empty:
-                return df_disk, None
+            age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
+            if age_hours < 6:
+                df_disk = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+                if not df_disk.empty:
+                    return df_disk, None
         except Exception:
             pass
 
     try:
-        t_obj = yf.Ticker(ticker)
-        df = t_obj.history(period=period, interval=interval, auto_adjust=True)
+        if interval == "1m":
+            df = _fetch_max_1m_stitched(ticker)
+        else:
+            t_obj = yf.Ticker(ticker)
+            df = t_obj.history(period=period, interval=interval, auto_adjust=True)
+            if not df.empty:
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                df.columns = ['open', 'high', 'low', 'close', 'volume']
+
         if not df.empty:
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-            df.columns = ['open', 'high', 'low', 'close', 'volume']
             df.to_csv(csv_path)
             return df, None
     except Exception:
@@ -181,20 +221,20 @@ def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[p
         try:
             df_stooq = _fetch_stooq_daily(ticker)
             df_stooq.to_csv(csv_path)
-            return df_stooq, "Yahoo IP rate-limit bypassed: Loaded full historical daily data via Stooq."
+            return df_stooq, "Yahoo IP rate-limit bypassed: Loaded full max historical daily data via Stooq."
         except Exception:
             try:
                 df_nasdaq = _fetch_nasdaq_daily(ticker)
                 df_nasdaq.to_csv(csv_path)
-                return df_nasdaq, "Yahoo IP rate-limit bypassed: Loaded full historical daily data via Nasdaq API."
+                return df_nasdaq, "Yahoo IP rate-limit bypassed: Loaded full max historical daily data via Nasdaq API."
             except Exception as e_nas:
                 return pd.DataFrame(), f"All daily data providers failed ({e_nas})."
 
     try:
-        days = YF_LIMIT_DAYS.get(interval, 7)
+        days = YF_LIMIT_DAYS.get(interval, 28)
         df_syn = _generate_intraday_from_daily(ticker, interval, days)
         return df_syn, (
-            f"Yahoo IP rate-limit active for '{interval}': Reconstructed {interval} bars "
+            f"Yahoo IP rate-limit active for '{interval}': Reconstructed max {days}d of {interval} bars "
             f"anchored to real Daily OHLCV."
         )
     except Exception as e:
@@ -203,10 +243,11 @@ def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[p
 
 def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional[str]]:
     """
-    Fetches ALL available 1-day bars (period='max') and constructs 1W, 1M, 1Y from the full 1-day dataset.
+    Fetches ALL available 1-day bars (period='max') to construct 1W, 1M, 1Y,
+    and fetches the maximum allowed window for 15m (60d), 5m (60d), and 1m (28d stitched).
     """
     ticker = ticker.upper().strip()
-    cache_key = f"{ticker}_{tf}"
+    cache_key = f"{ticker}_{tf}_max"
 
     if tf in ["1Y", "1M", "1W", "1d"]:
         base_key = f"{ticker}_1d_max"
@@ -244,7 +285,7 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
         return df_res, warn_msg
 
     else:
-        max_days = YF_LIMIT_DAYS.get(tf, 7)
+        max_days = YF_LIMIT_DAYS.get(tf, 60)
         warn_msg = None
         if cache_key not in DATA_CACHE:
             df_intra, warn_msg = _download_with_fallbacks(ticker, interval=tf, period=f"{max_days}d")
@@ -326,7 +367,6 @@ def compute_all_indicators(
     rs = gain / loss.replace(0, 1e-9)
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # Point-in-Time Fibonacci Retracement (Rolling 50-bar Swing High / Low)
     swing_window = min(50, max(5, n))
     df['swing_high'] = df['high'].rolling(swing_window, min_periods=1).max()
     df['swing_low'] = df['low'].rolling(swing_window, min_periods=1).min()
@@ -336,7 +376,6 @@ def compute_all_indicators(
     df['fib_618'] = df['swing_high'] - 0.618 * fib_range
     df['fib_786'] = df['swing_high'] - 0.786 * fib_range
 
-    # SMC: Both Bullish & Bearish Fair Value Gaps (FVG) + Mitigation Retests
     body_prev = (df['close'].shift(1) - df['open'].shift(1)).abs()
     df['fvg_bull'] = (df['low'] > df['high'].shift(2)) & (body_prev > 0.8 * df['atr'])
     df['fvg_bull_top'] = np.where(df['fvg_bull'], df['low'], np.nan)
@@ -358,7 +397,6 @@ def compute_all_indicators(
     f_bear = df['fvg_bear'].values
 
     for i in range(2, n):
-        # Bullish FVG retest from above
         if not np.isnan(active_bull_top):
             if lows[i] <= active_bull_top and closes[i] >= active_bull_bot:
                 fvg_bull_retest[i] = True
@@ -369,7 +407,6 @@ def compute_all_indicators(
             active_bull_top = lows[i]
             active_bull_bot = highs[i - 2]
 
-        # Bearish FVG retest from below
         if not np.isnan(active_bear_bot):
             if highs[i] >= active_bear_bot and closes[i] <= active_bear_top:
                 fvg_bear_retest[i] = True
@@ -383,7 +420,6 @@ def compute_all_indicators(
     df['smc_fvg_bull_entry'] = fvg_bull_retest
     df['smc_fvg_bear_entry'] = fvg_bear_retest
 
-    # Opening Range Breakout (ORB)
     df['orb_high'] = np.nan
     df['orb_low'] = np.nan
     df['orb_mid'] = np.nan
@@ -405,7 +441,6 @@ def compute_all_indicators(
         df['orb_low'] = df['low'].rolling(5, min_periods=1).min().shift(1)
         df['orb_mid'] = (df['orb_high'] + df['orb_low']) / 2.0
 
-    # Composite Score [-1, +1]
     slope_norm = np.clip(((df['ema20'] - df['ema50']) / df['atr'].replace(0, 1)), -2.0, 2.0) / 2.0
     bar_press = ((df['close'] - df['open']) / (df['high'] - df['low'] + 1e-9)) * np.clip(df['rvol'] / 2.0, 0, 2.0)
     liq_norm = np.clip(bar_press, -1.0, 1.0)
@@ -417,7 +452,6 @@ def compute_all_indicators(
         total_w = 1.0
     df['composite_score'] = (w_trend * slope_norm + w_liq * liq_norm + w_rev * rev_norm) / total_w
 
-    # Unclear / Volatile Chop Detection
     ema_diff_ratio = (df['ema20'] - df['ema50']).abs() / df['atr'].replace(0, 1)
     df['is_unclear_volatile'] = (ema_diff_ratio < 0.32) | (
         (df['atr'] > 1.35 * df['atr'].rolling(20, min_periods=1).mean()) & (df['composite_score'].abs() < 0.20)
@@ -476,7 +510,7 @@ STRATEGY_METADATA = {
 def run_strategy_backtest(
     df: pd.DataFrame,
     strategy_key: str,
-    trade_side: str = "both",  # "both", "long", "short"
+    trade_side: str = "both",
     sl_mult: float = 1.5,
     tp_mult: float = 3.0,
     vol_model: str = "atr",
@@ -487,10 +521,6 @@ def run_strategy_backtest(
     manual_entry_ts: Optional[int] = None,
     manual_side: str = "long"
 ) -> Dict[str, Any]:
-    """
-    Bidirectional Lifecycle State Machine:
-    state: 0 = IDLE, 1 = WATCH_LONG, -1 = WATCH_SHORT, 2 = IN_LONG, -2 = IN_SHORT, 3 = STOPPED_LONG, -3 = STOPPED_SHORT
-    """
     n = len(df)
     if n == 0:
         return {"trades": [], "markers": [], "boxes": [], "stats": {}, "equity": []}
@@ -629,7 +659,6 @@ def run_strategy_backtest(
         if not allow_short:
             trend_short, trig_short = False, False
 
-        # ---------------- STATE MACHINE EXECUTION ----------------
         if state == 0:
             if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
                 is_long = trig_long
@@ -665,7 +694,6 @@ def run_strategy_backtest(
                 watch_trough = c_low
                 markers.append({"time": ts, "position": "aboveBar", "color": "#B0BEC5", "shape": "circle", "text": "WATCH S"})
 
-        # ---------------- WATCHING LONG (1) OR STOPPED LONG (3) ----------------
         elif state in [1, 3]:
             if not trend_long and manual_entry_ts is None:
                 state = -1 if trend_short else 0
@@ -700,7 +728,6 @@ def run_strategy_backtest(
                     "text": f"{'RE-BUY' if is_re else 'BUY'} @ {entry_price:.2f}"
                 })
 
-        # ---------------- WATCHING SHORT (-1) OR STOPPED SHORT (-3) ----------------
         elif state in [-1, -3]:
             if not trend_short and manual_entry_ts is None:
                 state = 1 if trend_long else 0
@@ -735,7 +762,6 @@ def run_strategy_backtest(
                     "text": f"{'RE-SHORT' if is_re else 'SHORT'} @ {entry_price:.2f}"
                 })
 
-        # ---------------- IN LONG POSITION (2) ----------------
         elif state == 2:
             hit_tp = c_high >= tp_price
             hit_sl = c_low <= sl_price
@@ -771,7 +797,6 @@ def run_strategy_backtest(
                     state = 3 if trend_long else (-1 if trend_short else 0)
                     watch_peak = c_high
 
-        # ---------------- IN SHORT POSITION (-2) ----------------
         elif state == -2:
             hit_tp = c_low <= tp_price
             hit_sl = c_high >= sl_price
@@ -928,10 +953,6 @@ def api_option_chain(
     spot: float = Query(100.0),
     gk_daily_vol_pct: float = Query(2.5)
 ):
-    """
-    Fetches live option expirations and Calls/Puts chain from Yahoo Finance.
-    If Yahoo rate-limits the cloud IP, constructs a realistic BSM chain around Spot.
-    """
     ticker = ticker.upper().strip()
     try:
         tk = yf.Ticker(ticker)
@@ -974,7 +995,6 @@ def api_option_chain(
     except Exception:
         pass
 
-    # Fallback BSM Option Chain if Yahoo rate-limits options endpoint
     exp_dates = [
         (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
         (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
@@ -1035,11 +1055,6 @@ def api_option_contract_history(
     opt_type: str = Query("call"),
     iv_pct: float = Query(55.0)
 ):
-    """
-    Fetches historical daily OHLCV for a specific Option Contract Symbol from Yahoo Finance.
-    If Yahoo has purged or rate-limited the contract, reconstructs its historical daily curve
-    from the underlying stock's historical daily closes via Black-Scholes.
-    """
     try:
         opt_tk = yf.Ticker(contract_symbol)
         df_opt = opt_tk.history(period="max", interval="1d")
@@ -1059,7 +1074,6 @@ def api_option_contract_history(
     except Exception:
         pass
 
-    # Reconstruct contract history from underlying 1d stock history
     df_stock, _ = fetch_and_construct_tf(ticker, "1d")
     df_sub = df_stock.tail(60)
     bars = []
@@ -1113,7 +1127,7 @@ def api_analyze(
     if start_ts is not None and start_ts < first_avail_ts:
         first_dt_str = df_raw.index[0].strftime("%Y-%m-%d %H:%M")
         extra_warn = (
-            f"Intraday limit: '{tf}' data is unavailable for the clicked date. "
+            f"Max lookback limit: '{tf}' data is unavailable for the clicked date. "
             f"Showing earliest available '{tf}' data starting from {first_dt_str}."
         )
         warn_msg = f"{warn_msg} | {extra_warn}" if warn_msg else extra_warn
@@ -1139,7 +1153,7 @@ def api_analyze(
         df_calc, tf, atr_mult=sl_mult, gk_mult=tp_mult, w_trend=w_trend, w_liq=w_liq, w_rev=w_rev
     )
 
-    # Full history for 1Y, 1M, 1W, 1d (No 500-bar truncation!)
+    # Use ALL available bars for the selected timeframe (no artificial cap)
     if start_ts is not None:
         start_dt = datetime.fromtimestamp(start_ts)
         df_view = df_ind[df_ind.index >= start_dt].copy()
@@ -1290,7 +1304,7 @@ def api_options_greeks(
 
 
 # ==============================================================================
-# 6. FRONTEND SINGLE-PAGE APPLICATION
+# 6. FRONTEND SINGLE-PAGE APPLICATION (FOLDABLE PANELS + DELETABLE TABS)
 # ==============================================================================
 HTML_PAGE = r"""
 <!DOCTYPE html>
@@ -1314,10 +1328,30 @@ HTML_PAGE = r"""
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; font-size: 13px; }
   
-  .sidebar { width: 345px; background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-  .card { background: #1a1f2e; border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
-  .card-title { font-weight: 700; font-size: 11.5px; text-transform: uppercase; color: #90a4ae; margin-bottom: 8px; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; }
-  
+  /* Left Foldable Sidebar */
+  .sidebar {
+    width: 340px; background: var(--panel); border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px;
+    transition: width 0.2s ease, padding 0.2s ease; flex-shrink: 0;
+  }
+  .sidebar.collapsed { width: 0; padding: 0; border-right: none; overflow: hidden; }
+
+  /* Collapsible Accordion Cards */
+  details.fold-card {
+    background: #1a1f2e; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+  }
+  details.fold-card > summary {
+    font-weight: 700; font-size: 11.5px; text-transform: uppercase; color: #90a4ae;
+    letter-spacing: 0.5px; cursor: pointer; list-style: none; display: flex;
+    justify-content: space-between; align-items: center; user-select: none;
+  }
+  details.fold-card > summary::-webkit-details-marker { display: none; }
+  details.fold-card > summary::after {
+    content: "▼"; font-size: 10px; color: var(--muted); transition: transform 0.15s ease;
+  }
+  details.fold-card:not([open]) > summary::after { transform: rotate(-90deg); }
+  details.fold-card[open] > summary { margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+
   label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; margin-top: 6px; }
   input[type="text"], input[type="number"], select {
     width: 100%; background: #0b0e14; border: 1px solid var(--border); color: var(--text);
@@ -1331,24 +1365,44 @@ HTML_PAGE = r"""
   
   button.btn {
     background: var(--accent); color: #fff; border: none; border-radius: 4px;
-    padding: 7px 10px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px;
+    padding: 6px 10px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; font-size: 12px;
   }
   button.btn:hover { opacity: 0.9; }
   button.btn-sec { background: #2a2e39; color: var(--text); }
   
-  .main { flex: 1; display: flex; flex-direction: column; overflow-y: auto; }
+  /* Main Viewport */
+  .main { flex: 1; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; }
   
   .topbar {
-    background: var(--panel); border-bottom: 1px solid var(--border); padding: 8px 14px;
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--panel); border-bottom: 1px solid var(--border); padding: 6px 12px;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0;
   }
-  .breadcrumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .left-nav { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .toggle-btn {
+    background: #262b3d; border: 1px solid #363c4e; color: var(--text);
+    padding: 4px 9px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: 600;
+  }
+  .toggle-btn:hover { background: #323950; }
+
+  /* Deletable Breadcrumb Tabs */
+  .breadcrumbs { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .crumb {
     background: #1e2433; border: 1px solid #363c4e; color: var(--text);
-    padding: 4px 9px; border-radius: 4px; font-size: 11px; cursor: pointer;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; display: inline-flex;
+    align-items: center; gap: 6px; cursor: pointer;
   }
   .crumb.active { background: var(--accent); border-color: var(--accent); font-weight: 700; }
-  .tf-selector { display: flex; gap: 4px; }
+  .crumb-close {
+    font-weight: bold; color: #ff8a80; cursor: pointer; padding: 0 3px; border-radius: 3px;
+    font-size: 12px; line-height: 1;
+  }
+  .crumb-close:hover { background: rgba(255, 23, 68, 0.35); color: #fff; }
+  .crumb-clear {
+    background: rgba(255, 23, 68, 0.15); border: 1px solid rgba(255, 23, 68, 0.4);
+    color: #ff8a80; padding: 3px 7px; border-radius: 4px; font-size: 10.5px; cursor: pointer;
+  }
+
+  .tf-selector { display: flex; gap: 4px; align-items: center; }
   .tf-btn {
     background: #1a1f2e; border: 1px solid var(--border); color: var(--muted);
     padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600;
@@ -1357,10 +1411,14 @@ HTML_PAGE = r"""
   
   .alert-banner {
     background: rgba(255, 152, 0, 0.15); border-bottom: 1px solid #ff9800;
-    color: #ffb74d; padding: 6px 14px; font-size: 12px; display: none;
+    color: #ffb74d; padding: 5px 14px; font-size: 11.5px; display: none; flex-shrink: 0;
   }
 
-  .chart-wrapper { position: relative; width: 100%; height: 490px; background: #0b0e14; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  /* Dynamic Chart Area - Expands Automatically When Bottom Panels Are Folded */
+  .chart-wrapper {
+    position: relative; width: 100%; flex: 1; min-height: 440px;
+    background: #0b0e14; border-bottom: 1px solid var(--border);
+  }
   #tv-chart { width: 100%; height: 100%; }
   #overlay-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
   .chart-legend {
@@ -1368,8 +1426,9 @@ HTML_PAGE = r"""
     padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45;
   }
 
-  .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 12px; padding: 12px; }
-  .options-chain-section { padding: 0 12px 16px 12px; }
+  /* Foldable Bottom Panels Container */
+  .bottom-panels { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+  .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
   th, td { padding: 5px 7px; text-align: left; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 600; background: #161b26; position: sticky; top: 0; }
@@ -1384,10 +1443,10 @@ HTML_PAGE = r"""
 </head>
 <body>
 
-<!-- ==================== LEFT SIDEBAR ==================== -->
-<div class="sidebar">
-  <div class="card">
-    <div class="card-title">1. Asset, Side & Click Action</div>
+<!-- ==================== FOLDABLE LEFT SIDEBAR ==================== -->
+<div class="sidebar" id="sidebar">
+  <details class="fold-card" open>
+    <summary>1. Asset, Side & Click Action</summary>
     <div class="row-2">
       <div>
         <label>Ticker (e.g. SNDK, NVDA, ASTS)</label>
@@ -1410,13 +1469,13 @@ HTML_PAGE = r"""
       <option value="cutoff">Set Point-in-Time Cutoff Date</option>
     </select>
     <div class="row-2" style="margin-top:4px;">
-      <button class="btn" onclick="resetToRoot()">Load Full History</button>
+      <button class="btn" onclick="resetToRoot()">Load Max History</button>
       <button class="btn btn-sec" onclick="clearCutoffAndManual()">Reset Cutoff/Manual</button>
     </div>
-  </div>
+  </details>
 
-  <div class="card">
-    <div class="card-title">2. Strategy & Auto-Indicators</div>
+  <details class="fold-card" open>
+    <summary>2. Strategy & Auto-Indicators</summary>
     <label>Active Strategy</label>
     <select id="strategy" onchange="onStrategyChange()">
       <option value="trend">1. Core Trend (EMA 20/50 + Volume L/S)</option>
@@ -1454,10 +1513,10 @@ HTML_PAGE = r"""
       <div><label>g (VWAP)</label><input type="number" id="w_rev" value="0.2" step="0.1"></div>
     </div>
     <button class="btn" onclick="loadChartData()">Apply Parameters</button>
-  </div>
+  </details>
 
-  <div class="card">
-    <div class="card-title">3. Selectable Overlays & Zones</div>
+  <details class="fold-card" open>
+    <summary>3. Selectable Overlays & Zones</summary>
     <div class="chk-grid">
       <label class="chk-item"><input type="checkbox" id="chk_ema20" checked onchange="renderOverlays()"> EMA 20 & 50</label>
       <label class="chk-item"><input type="checkbox" id="chk_vwap" onchange="renderOverlays()"> Session VWAP</label>
@@ -1470,10 +1529,10 @@ HTML_PAGE = r"""
       <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
       <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
     </div>
-  </div>
+  </details>
 
-  <div class="card">
-    <div class="card-title">4. Portfolio & Position Sizing ($100k)</div>
+  <details class="fold-card">
+    <summary>4. Portfolio & Position Sizing ($100k)</summary>
     <div class="row-2">
       <div>
         <label>Starting Capital ($)</label>
@@ -1494,13 +1553,17 @@ HTML_PAGE = r"""
         <input type="number" id="intraday_pct" value="30" step="5">
       </div>
     </div>
-  </div>
+  </details>
 </div>
 
 <!-- ==================== MAIN VIEWPORT ==================== -->
 <div class="main">
   <div class="topbar">
-    <div class="breadcrumbs" id="breadcrumb-bar"></div>
+    <div class="left-nav">
+      <button class="toggle-btn" id="btn-sidebar" onclick="toggleSidebar()">◀ Hide Controls</button>
+      <button class="toggle-btn" id="btn-panels" onclick="toggleAllPanels()">▼ Fold All Panels</button>
+      <div class="breadcrumbs" id="breadcrumb-bar"></div>
+    </div>
     <div class="tf-selector" id="tf-buttons">
       <button class="tf-btn active" onclick="switchTF('1Y')">1Y</button>
       <button class="tf-btn" onclick="switchTF('1M')">1M</button>
@@ -1514,69 +1577,69 @@ HTML_PAGE = r"""
 
   <div class="alert-banner" id="alert-banner"></div>
 
-  <div class="chart-wrapper">
+  <!-- Primary Candlestick & Overlay Plot -->
+  <div class="chart-wrapper" id="chart-wrap">
     <div class="chart-legend" id="chart-legend">Loading...</div>
     <div id="tv-chart"></div>
     <canvas id="overlay-canvas"></canvas>
   </div>
 
-  <!-- Summary Table & Option Calculator -->
-  <div class="bottom-grid">
-    <div class="card">
-      <div class="card-title">
-        <span>All Strategies Comparison ($100k Baseline - Long & Short)</span>
-        <span id="bh-badge" style="color:var(--gold)"></span>
-      </div>
-      <div style="overflow-x:auto;">
-        <table id="summary-table">
-          <thead>
-            <tr>
-              <th>Strategy</th>
-              <th>Pool</th>
-              <th>Ending Equity</th>
-              <th>Net Return</th>
-              <th>Trades (L / S)</th>
-              <th>Win Rate</th>
-              <th>Profit Factor</th>
-              <th>Max DD</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
+  <!-- Foldable Bottom Panels -->
+  <div class="bottom-panels">
+    <div class="bottom-grid">
+      <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
+        <summary>
+          <span>All Strategies Backtest Comparison ($100k Baseline — Long & Short)</span>
+          <span id="bh-badge" style="color:var(--gold); margin-right:10px;"></span>
+        </summary>
+        <div style="overflow-x:auto; max-height:210px;">
+          <table id="summary-table">
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Pool</th>
+                <th>Ending Equity</th>
+                <th>Net Return</th>
+                <th>Trades (L / S)</th>
+                <th>Win Rate</th>
+                <th>Profit Factor</th>
+                <th>Max DD</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+
+      <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
+        <summary>Options Greeks & Implied Expectancy Calculator</summary>
+        <div class="row-3">
+          <div><label>Spot ($)</label><input type="number" id="opt_spot" value="100" step="1"></div>
+          <div><label>Strike ($)</label><input type="number" id="opt_strike" value="105" step="1"></div>
+          <div><label>Type</label>
+            <select id="opt_type"><option value="call">CALL</option><option value="put">PUT</option></select>
+          </div>
+        </div>
+        <div class="row-3">
+          <div><label>DTE (Days)</label><input type="number" id="opt_dte" value="14"></div>
+          <div><label>Implied Vol (%)</label><input type="number" id="opt_iv" value="55"></div>
+          <div><label>GK Daily Vol (%)</label><input type="number" id="opt_gk" value="2.5" readonly></div>
+        </div>
+        <button class="btn" onclick="calcOptions()">Evaluate Option & Stock Expectancy</button>
+        <div id="opt-results" style="margin-top:6px; font-size:11px; line-height:1.5;"></div>
+      </details>
     </div>
 
-    <div class="card">
-      <div class="card-title">Options Greeks & Implied Expectancy Calculator</div>
-      <div class="row-3">
-        <div><label>Spot ($)</label><input type="number" id="opt_spot" value="100" step="1"></div>
-        <div><label>Strike ($)</label><input type="number" id="opt_strike" value="105" step="1"></div>
-        <div><label>Type</label>
-          <select id="opt_type"><option value="call">CALL</option><option value="put">PUT</option></select>
-        </div>
-      </div>
-      <div class="row-3">
-        <div><label>DTE (Days)</label><input type="number" id="opt_dte" value="14"></div>
-        <div><label>Implied Vol (%)</label><input type="number" id="opt_iv" value="55"></div>
-        <div><label>GK Daily Vol (%)</label><input type="number" id="opt_gk" value="2.5" readonly></div>
-      </div>
-      <button class="btn" onclick="calcOptions()">Evaluate Option & Stock Expectancy</button>
-      <div id="opt-results" style="margin-top:8px; font-size:11.5px; line-height:1.55;"></div>
-    </div>
-  </div>
-
-  <!-- Live Yahoo Finance Option Chain & Contract History Viewer -->
-  <div class="options-chain-section">
-    <div class="card">
-      <div class="card-title">
-        <span>Live Option Chain Browser & Contract Price History (Click Any Contract Row to Inspect History)</span>
-        <div style="display:flex; align-items:center; gap:8px;">
-          <span id="chain-source" style="color:var(--muted); font-weight:normal;"></span>
-          <select id="chain_expiry" style="width:140px;" onchange="loadOptionChain(this.value)"></select>
-        </div>
+    <details class="fold-card bottom-fold" ontoggle="resizeChart()">
+      <summary>
+        <span>Live Option Chain Browser & Contract Price History (Click to Expand / Collapse)</span>
+        <span id="chain-source" style="color:var(--muted); font-weight:normal; font-size:10.5px; margin-right:10px;"></span>
+      </summary>
+      <div style="display:flex; justify-content:flex-end; margin-bottom:6px;">
+        <select id="chain_expiry" style="width:150px;" onchange="loadOptionChain(this.value)"></select>
       </div>
       <div class="row-2" style="gap:14px;">
-        <div style="max-height:240px; overflow-y:auto;">
+        <div style="max-height:200px; overflow-y:auto;">
           <div style="font-weight:700; color:var(--green); margin-bottom:4px;">CALLS (Click row for contract history)</div>
           <table id="calls-table">
             <thead>
@@ -1585,7 +1648,7 @@ HTML_PAGE = r"""
             <tbody></tbody>
           </table>
         </div>
-        <div style="max-height:240px; overflow-y:auto;">
+        <div style="max-height:200px; overflow-y:auto;">
           <div style="font-weight:700; color:var(--red); margin-bottom:4px;">PUTS (Click row for contract history)</div>
           <table id="puts-table">
             <thead>
@@ -1595,11 +1658,11 @@ HTML_PAGE = r"""
           </table>
         </div>
       </div>
-      <div id="contract-history-box" style="margin-top:10px; padding-top:8px; border-top:1px solid var(--border); display:none;">
+      <div id="contract-history-box" style="margin-top:8px; padding-top:8px; border-top:1px solid var(--border); display:none;">
         <div style="font-weight:700; margin-bottom:6px; color:#00b0ff;" id="contract-hist-title"></div>
         <div id="contract-hist-strip" style="display:flex; gap:6px; overflow-x:auto; padding-bottom:4px;"></div>
       </div>
-    </div>
+    </details>
   </div>
 </div>
 
@@ -1608,12 +1671,40 @@ let chart, candleSeries, volumeSeries;
 let lineSeriesMap = {};
 let currentData = null;
 
+// Navigation & Deletable Tab State
 let currentTF = "1Y";
 let currentStartTs = null;
 let currentCutoffTs = null;
 let manualEntryTs = null;
 let manualSide = "long";
-let breadcrumbs = [{ label: "All Years (1Y)", tf: "1Y", startTs: null }];
+let breadcrumbs = [{ label: "Max (1Y)", tf: "1Y", startTs: null }];
+let activeCrumbIdx = 0;
+let allPanelsFolded = false;
+
+function toggleSidebar() {
+  const sb = document.getElementById('sidebar');
+  const btn = document.getElementById('btn-sidebar');
+  sb.classList.toggle('collapsed');
+  btn.textContent = sb.classList.contains('collapsed') ? '▶ Show Controls' : '◀ Hide Controls';
+  setTimeout(resizeChart, 220);
+}
+
+function toggleAllPanels() {
+  allPanelsFolded = !allPanelsFolded;
+  document.querySelectorAll('details.bottom-fold').forEach(d => {
+    if (allPanelsFolded) d.removeAttribute('open');
+    else d.setAttribute('open', '');
+  });
+  document.getElementById('btn-panels').textContent = allPanelsFolded ? '▲ Expand Panels' : '▼ Fold All Panels';
+  setTimeout(resizeChart, 60);
+}
+
+function resizeChart() {
+  if (!chart) return;
+  const wrap = document.getElementById('chart-wrap');
+  chart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
+  requestAnimationFrame(drawCanvasZones);
+}
 
 function initChart() {
   const container = document.getElementById('tv-chart');
@@ -1660,11 +1751,7 @@ function initChart() {
   }
 
   chart.timeScale().subscribeVisibleTimeRangeChange(() => requestAnimationFrame(drawCanvasZones));
-  window.addEventListener('resize', () => {
-    const wrap = document.querySelector('.chart-wrapper');
-    chart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
-    requestAnimationFrame(drawCanvasZones);
-  });
+  window.addEventListener('resize', resizeChart);
 
   chart.subscribeClick((param) => {
     if (!param || !param.time || !currentData) return;
@@ -1676,7 +1763,6 @@ function initChart() {
     if (mode === 'drill') {
       const nextTf = currentData.next_tf;
       if (nextTf === currentTF && currentTF === '1m') return;
-      // When drilling down from a Yearly bar, start from Jan 1 of that clicked year!
       if (currentTF === '1Y') {
         const yr = dtObj.getUTCFullYear();
         currentStartTs = Math.floor(Date.UTC(yr, 0, 1) / 1000);
@@ -1688,7 +1774,18 @@ function initChart() {
         currentStartTs = clickedTs;
       }
       currentTF = nextTf;
-      breadcrumbs.push({ label: `${dtStr} (${currentTF})`, tf: currentTF, startTs: currentStartTs });
+
+      // Trim any tabs after activeCrumbIdx, and replace if same timeframe already exists so tabs don't stack infinitely
+      breadcrumbs = breadcrumbs.slice(0, activeCrumbIdx + 1);
+      const existingIdx = breadcrumbs.findIndex(b => b.tf === currentTF);
+      const newTab = { label: `${dtStr} (${currentTF})`, tf: currentTF, startTs: currentStartTs };
+      if (existingIdx !== -1) {
+        breadcrumbs[existingIdx] = newTab;
+        breadcrumbs = breadcrumbs.slice(0, existingIdx + 1);
+      } else {
+        breadcrumbs.push(newTab);
+      }
+      activeCrumbIdx = breadcrumbs.length - 1;
       loadChartData();
     } else if (mode === 'manual_long') {
       document.getElementById('strategy').value = 'plain_tpsl';
@@ -1712,25 +1809,71 @@ function renderBreadcrumbs() {
   bar.innerHTML = '';
   breadcrumbs.forEach((b, idx) => {
     const el = document.createElement('span');
-    el.className = 'crumb' + (idx === breadcrumbs.length - 1 ? ' active' : '');
-    el.textContent = b.label;
-    el.onclick = () => {
-      breadcrumbs = breadcrumbs.slice(0, idx + 1);
+    el.className = 'crumb' + (idx === activeCrumbIdx ? ' active' : '');
+
+    const lbl = document.createElement('span');
+    lbl.textContent = b.label;
+    lbl.onclick = () => {
+      activeCrumbIdx = idx;
       currentTF = b.tf;
       currentStartTs = b.startTs;
       loadChartData();
     };
+    el.appendChild(lbl);
+
+    // Add 'x' delete button on every tab (if only 1 tab remains, clicking 'x' resets it to root)
+    const closeBtn = document.createElement('span');
+    closeBtn.className = 'crumb-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Delete this navigation tab';
+    closeBtn.onclick = (e) => {
+      e.stopPropagation();
+      deleteCrumb(idx);
+    };
+    el.appendChild(closeBtn);
+
     bar.appendChild(el);
   });
+
+  if (breadcrumbs.length > 1) {
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'crumb-clear';
+    clearBtn.textContent = 'Clear All';
+    clearBtn.onclick = resetToRoot;
+    bar.appendChild(clearBtn);
+  }
 
   document.querySelectorAll('.tf-btn').forEach(btn => {
     btn.classList.toggle('active', btn.textContent.toLowerCase() === currentTF.toLowerCase());
   });
 }
 
+function deleteCrumb(idx) {
+  if (breadcrumbs.length <= 1) {
+    resetToRoot();
+    return;
+  }
+  breadcrumbs.splice(idx, 1);
+  if (activeCrumbIdx >= breadcrumbs.length) {
+    activeCrumbIdx = breadcrumbs.length - 1;
+  }
+  const activeTab = breadcrumbs[activeCrumbIdx];
+  currentTF = activeTab.tf;
+  currentStartTs = activeTab.startTs;
+  loadChartData();
+}
+
 function switchTF(tf) {
+  // Replaces the current active tab in-place instead of stacking new tabs!
   currentTF = tf;
-  breadcrumbs.push({ label: `View (${tf})`, tf: tf, startTs: currentStartTs });
+  const datePrefix = currentStartTs
+    ? new Date(currentStartTs * 1000).toISOString().slice(0, 10)
+    : 'Max';
+  breadcrumbs[activeCrumbIdx] = {
+    label: `${datePrefix} (${tf})`,
+    tf: tf,
+    startTs: currentStartTs
+  };
   loadChartData();
 }
 
@@ -1739,7 +1882,8 @@ function resetToRoot() {
   currentStartTs = null;
   currentCutoffTs = null;
   manualEntryTs = null;
-  breadcrumbs = [{ label: `All Years (1Y)`, tf: '1Y', startTs: null }];
+  breadcrumbs = [{ label: `Max (1Y)`, tf: '1Y', startTs: null }];
+  activeCrumbIdx = 0;
   loadChartData();
 }
 
@@ -1819,6 +1963,7 @@ async function loadChartData() {
   document.getElementById('opt_gk').value = data.latest_metrics.gk_daily_vol_pct;
   calcOptions();
   loadOptionChain();
+  setTimeout(resizeChart, 50);
 }
 
 function renderOverlays() {
@@ -1867,7 +2012,7 @@ function renderOverlays() {
 
 function drawCanvasZones() {
   const canvas = document.getElementById('overlay-canvas');
-  const wrap = document.querySelector('.chart-wrapper');
+  const wrap = document.getElementById('chart-wrap');
   canvas.width = wrap.clientWidth;
   canvas.height = wrap.clientHeight;
   const ctx = canvas.getContext('2d');
@@ -1876,7 +2021,6 @@ function drawCanvasZones() {
   if (!currentData) return;
   const tsScale = chart.timeScale();
 
-  // 1. Gray Volatile / Unclear Spans
   if (document.getElementById('chk_unclear').checked && currentData.unclear_spans) {
     ctx.fillStyle = 'rgba(120, 123, 134, 0.14)';
     ctx.font = '10px sans-serif';
@@ -1892,7 +2036,6 @@ function drawCanvasZones() {
     });
   }
 
-  // 2. SMC Bullish & Bearish FVG Boxes
   if (document.getElementById('chk_fvg_zones').checked && currentData.fvg_boxes) {
     currentData.fvg_boxes.forEach(b => {
       const x1 = tsScale.timeToCoordinate(b.t1);
@@ -1909,7 +2052,6 @@ function drawCanvasZones() {
     });
   }
 
-  // 3. Shaded TP (Green) and SL (Red) Trade Lifecycle Boxes (Works for both Long & Short!)
   if (document.getElementById('chk_tpsl_boxes').checked && currentData.backtest.boxes) {
     currentData.backtest.boxes.forEach(b => {
       const x1 = tsScale.timeToCoordinate(b.t1);
@@ -1920,19 +2062,16 @@ function drawCanvasZones() {
       if (x1 === null || x2 === null || yEntry === null || yTp === null || ySl === null) return;
       const w = Math.max(x2 - x1, 14);
 
-      // Green Take-Profit Zone
       ctx.fillStyle = 'rgba(0, 230, 118, 0.16)';
       ctx.strokeStyle = 'rgba(0, 230, 118, 0.8)';
       ctx.fillRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
       ctx.strokeRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
 
-      // Red Stop-Loss Zone
       ctx.fillStyle = 'rgba(255, 23, 68, 0.16)';
       ctx.strokeStyle = 'rgba(255, 23, 68, 0.8)';
       ctx.fillRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
       ctx.strokeRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
 
-      // Garman-Klass dashed comparison TP/SL lines
       const yGkTp = candleSeries.priceToCoordinate(b.alt_tp);
       const yGkSl = candleSeries.priceToCoordinate(b.alt_sl);
       if (yGkTp !== null && yGkSl !== null) {
@@ -1956,7 +2095,7 @@ function updateSummaryTable(data) {
 
   if (data.all_strategies_summary.length > 0) {
     const bh = data.all_strategies_summary[0].buy_hold_pct;
-    document.getElementById('bh-badge').textContent = `Buy & Hold Benchmark: ${bh >= 0 ? '+' : ''}${bh}%`;
+    document.getElementById('bh-badge').textContent = `Buy & Hold: ${bh >= 0 ? '+' : ''}${bh}%`;
   }
 
   data.all_strategies_summary.forEach(row => {
@@ -1997,7 +2136,7 @@ async function calcOptions() {
     <div><b>Theoretical Value:</b> $${d.theo_price} | <b>Breakeven:</b> $${d.breakeven} | <b>Prob ITM:</b> ${d.prob_itm_pct}%</div>
     <div><b>Greeks:</b> Delta: ${d.delta} | Gamma: ${d.gamma} | Theta: $${d.theta_daily}/day | Vega: $${d.vega_per_1pct}</div>
     <div><b>Expected Move (+-1s):</b> Implied: +-$${d.expected_move_iv} vs. GK Realized: +-$${d.expected_move_hv} (IV/HV: ${d.iv_hv_ratio}x)</div>
-    <div style="margin-top:4px; color:#ffd600;"><b>Verdict:</b> ${d.verdict}</div>
+    <div style="margin-top:3px; color:#ffd600;"><b>Verdict:</b> ${d.verdict}</div>
   `;
 }
 
