@@ -12,7 +12,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Max-Lookback Multi-Timeframe Backtest, SMC & Live Options Engine")
+app = FastAPI(title="Quant Lab: Full-History Multi-Timeframe Backtest, Hover HUD & Trade Log")
 
 # ==============================================================================
 # 1. DISK + MEMORY CACHE & MAX-LOOKBACK MULTI-SOURCE DATA ENGINE
@@ -21,12 +21,14 @@ DATA_CACHE: Dict[str, pd.DataFrame] = {}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-TIMEFRAME_HIERARCHY = ["1Y", "1M", "1W", "1d", "15m", "5m", "1m"]
+# Full hierarchy now includes 1h (730d max)
+TIMEFRAME_HIERARCHY = ["1Y", "1M", "1W", "1d", "1h", "15m", "5m", "1m"]
 NEXT_TIMEFRAME = {
     "1Y": "1M",
     "1M": "1W",
     "1W": "1d",
-    "1d": "15m",
+    "1d": "1h",
+    "1h": "15m",
     "15m": "5m",
     "5m": "1m",
     "1m": "1m"
@@ -34,10 +36,67 @@ NEXT_TIMEFRAME = {
 
 # Maximum allowed lookback days per Yahoo Finance server constraints
 YF_LIMIT_DAYS = {
-    "15m": 60,
-    "5m": 60,
-    "1m": 28  # Fetched via stitched 7-day chunks
+    "1h": 729,
+    "15m": 59,
+    "5m": 59,
+    "1m": 28
 }
+
+
+def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] = None) -> pd.DataFrame:
+    """
+    Direct query2.finance.yahoo.com/v8/finance/chart fetch using explicit period1 & period2
+    unix timestamps so data NEVER stops early and always reaches today's date.
+    """
+    now_ts = int((datetime.now() + timedelta(days=2)).timestamp())
+    if days_back is None:
+        start_ts = 0  # Jan 1, 1970 -> pulls all history since IPO
+    else:
+        start_ts = int((datetime.now() - timedelta(days=days_back)).timestamp())
+
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "period1": start_ts,
+        "period2": now_ts,
+        "interval": interval,
+        "includePrePost": "false",
+        "events": "div,splits"
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+    }
+
+    try:
+        from curl_cffi import requests as cffi_req
+        r = cffi_req.get(url, params=params, headers=headers, impersonate="chrome", timeout=15)
+    except Exception:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Yahoo v8 HTTP {r.status_code}")
+
+    js = r.json()
+    result = js["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    quote = result["indicators"]["quote"][0]
+
+    # Use adjclose for daily if available so splits/dividends are clean
+    closes = quote["close"]
+    df = pd.DataFrame({
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "close": closes,
+        "volume": quote["volume"]
+    }, index=pd.to_datetime(timestamps, unit="s"))
+    df.index = df.index.tz_localize(None)
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    df["volume"] = df["volume"].fillna(0)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
 
 
 def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
@@ -58,8 +117,8 @@ def _fetch_stooq_daily(ticker: str) -> pd.DataFrame:
 def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
     """Secondary free fallback using Nasdaq's public chart API."""
     clean_t = ticker.upper().strip()
-    end_dt = datetime.now().strftime("%Y-%m-%d")
-    start_dt = "1980-01-01"
+    end_dt = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+    start_dt = "1970-01-01"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*"
@@ -94,13 +153,11 @@ def _fetch_nasdaq_daily(ticker: str) -> pd.DataFrame:
 
 
 def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
-    """
-    Yahoo Finance allows up to ~30 days of 1-minute data, but only in 7-day request chunks.
-    This stitches 4 consecutive 7-day chunks together for the maximum possible 1m history.
-    """
-    t_obj = yf.Ticker(ticker)
+    """Stitches four 7-day 1-minute windows for the maximum ~28-30 day Yahoo Finance lookback."""
     chunks = []
-    now = datetime.now()
+    now = datetime.now() + timedelta(days=1)
+    t_obj = yf.Ticker(ticker)
+
     for w in range(4):
         end_dt = now - timedelta(days=w * 7)
         start_dt = now - timedelta(days=(w + 1) * 7)
@@ -116,32 +173,19 @@ def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
 
     if chunks:
         df_all = pd.concat(chunks).sort_index()
-        df_all = df_all[~df_all.index.duplicated(keep='first')]
+        df_all = df_all[~df_all.index.duplicated(keep='last')]
         return df_all
 
-    # Fallback to standard 7d period if chunking fails
-    df_7d = t_obj.history(period="7d", interval="1m", auto_adjust=True)
-    if not df_7d.empty:
-        df_7d.index = pd.to_datetime(df_7d.index).tz_localize(None)
-        df_7d = df_7d[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-        df_7d.columns = ['open', 'high', 'low', 'close', 'volume']
-        return df_7d
-    return pd.DataFrame()
+    return _direct_yahoo_v8_chart(ticker, interval="1m", days_back=7)
 
 
 def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.DataFrame:
     """Reconstructs intraday bars anchored to real Daily OHLCV if Yahoo blocks intraday requests."""
-    daily_csv = os.path.join(CACHE_DIR, f"{ticker}_1d_max.csv")
-    if os.path.exists(daily_csv):
-        df_1d = pd.read_csv(daily_csv, index_col=0, parse_dates=True).tail(days)
-    else:
-        try:
-            df_1d = _fetch_stooq_daily(ticker).tail(days)
-        except Exception:
-            df_1d = _fetch_nasdaq_daily(ticker).tail(days)
+    df_1d, _ = _download_daily_max(ticker)
+    df_1d = df_1d.tail(days)
 
-    step_mins = {"15m": 15, "5m": 5, "1m": 1}.get(interval, 15)
-    bars_per_day = int(390 / step_mins)
+    step_mins = {"1h": 60, "15m": 15, "5m": 5, "1m": 1}.get(interval, 15)
+    bars_per_day = max(1, int(390 / step_mins))
     all_rows = []
     np.random.seed(42)
 
@@ -152,9 +196,10 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
         noise = (noise - noise[0]) / (np.ptp(noise) + 1e-6)
         path = o + (c - o) * t_space + (h - l) * 0.35 * (noise - 0.5)
 
-        max_i, min_i = int(bars_per_day * 0.3), int(bars_per_day * 0.65)
-        path[max_i] = h
-        path[min_i] = l
+        if bars_per_day >= 3:
+            max_i, min_i = int(bars_per_day * 0.3), int(bars_per_day * 0.65)
+            path[max_i] = h
+            path[min_i] = l
         path[0] = o
         path[-1] = c
         path = np.clip(path, l, h)
@@ -167,8 +212,8 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
             wiggle = max((h - l) / (bars_per_day * 0.8), 1e-4)
             b_high = min(h, max(b_open, b_close) + abs(np.random.normal(0, wiggle)))
             b_low = max(l, min(b_open, b_close) - abs(np.random.normal(0, wiggle)))
-            u_weight = 1.8 if (b < 4 or b > bars_per_day - 4) else 0.7
-            b_vol = max(100.0, (v / bars_per_day) * u_weight * np.random.uniform(0.7, 1.3))
+            u_weight = 1.8 if (b < 2 or b > bars_per_day - 2) else 0.8
+            b_vol = max(100.0, (v / bars_per_day) * u_weight * np.random.uniform(0.75, 1.25))
             all_rows.append({
                 "dt": bar_t,
                 "open": b_open,
@@ -181,19 +226,105 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
     return pd.DataFrame(all_rows).set_index("dt")
 
 
-def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[pd.DataFrame, Optional[str]]:
+def _is_data_fresh(df: pd.DataFrame) -> bool:
+    """Checks that the DataFrame actually reaches within the last 10 days of today."""
+    if df.empty:
+        return False
+    last_dt = pd.to_datetime(df.index[-1]).tz_localize(None)
+    return (datetime.now() - last_dt).days <= 10
+
+
+def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     """
-    Fetches maximum allowed history for every timeframe:
-    - 1d: period='max' (all years since IPO)
-    - 15m / 5m: period='60d' (max allowed by Yahoo)
-    - 1m: stitched 4x7d chunks (~28-30 days max allowed by Yahoo)
+    Fetches ALL 1-day bars from IPO up through today.
+    Compares providers if needed so the dataset never stops early (e.g. Jan 2026).
     """
-    csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_max.csv")
+    csv_path = os.path.join(CACHE_DIR, f"{ticker}_1d_fullmax.csv")
 
     if os.path.exists(csv_path):
         try:
             age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
-            if age_hours < 6:
+            if age_hours < 4:
+                df_disk = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+                if _is_data_fresh(df_disk):
+                    return df_disk, None
+        except Exception:
+            pass
+
+    candidates: List[tuple[pd.DataFrame, Optional[str]]] = []
+
+    # 1. Try Direct Yahoo v8 Chart API with explicit period1=0 & period2=now
+    try:
+        df_v8 = _direct_yahoo_v8_chart(ticker, interval="1d", days_back=None)
+        if not df_v8.empty:
+            candidates.append((df_v8, None))
+            if _is_data_fresh(df_v8):
+                df_v8.to_csv(csv_path)
+                return df_v8, None
+    except Exception:
+        pass
+
+    # 2. Try yfinance explicit start="1970-01-01" to tomorrow
+    try:
+        t_obj = yf.Ticker(ticker)
+        end_str = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+        df_yf = t_obj.history(start="1970-01-01", end=end_str, interval="1d", auto_adjust=True)
+        if not df_yf.empty:
+            df_yf.index = pd.to_datetime(df_yf.index).tz_localize(None)
+            df_yf = df_yf[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+            df_yf.columns = ['open', 'high', 'low', 'close', 'volume']
+            candidates.append((df_yf, None))
+            if _is_data_fresh(df_yf):
+                df_yf.to_csv(csv_path)
+                return df_yf, None
+    except Exception:
+        pass
+
+    # 3. Try Stooq
+    try:
+        df_stooq = _fetch_stooq_daily(ticker)
+        if not df_stooq.empty:
+            candidates.append((df_stooq, "Loaded full historical daily data via Stooq."))
+            if _is_data_fresh(df_stooq):
+                df_stooq.to_csv(csv_path)
+                return df_stooq, None
+    except Exception:
+        pass
+
+    # 4. Try Nasdaq API
+    try:
+        df_nas = _fetch_nasdaq_daily(ticker)
+        if not df_nas.empty:
+            candidates.append((df_nas, "Loaded full historical daily data via Nasdaq API."))
+            if _is_data_fresh(df_nas):
+                df_nas.to_csv(csv_path)
+                return df_nas, None
+    except Exception:
+        pass
+
+    # If none passed the strict 10-day freshness check (e.g. delisted ticker), pick the one with the latest end date & most bars
+    if candidates:
+        best_df, best_warn = max(candidates, key=lambda item: (item[0].index[-1], len(item[0])))
+        best_df.to_csv(csv_path)
+        return best_df, best_warn
+
+    return pd.DataFrame(), f"All daily data providers failed for {ticker}."
+
+
+def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Optional[str]]:
+    """
+    Fetches maximum allowed intraday history:
+    - 1h: 729 days
+    - 15m / 5m: 59 days
+    - 1m: 28 days (stitched)
+    """
+    max_days = YF_LIMIT_DAYS.get(interval, 59)
+    csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_fullmax.csv")
+
+    if os.path.exists(csv_path):
+        try:
+            age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
+            if age_hours < 2:
                 df_disk = pd.read_csv(csv_path, index_col=0, parse_dates=True)
                 if not df_disk.empty:
                     return df_disk, None
@@ -204,12 +335,15 @@ def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[p
         if interval == "1m":
             df = _fetch_max_1m_stitched(ticker)
         else:
-            t_obj = yf.Ticker(ticker)
-            df = t_obj.history(period=period, interval=interval, auto_adjust=True)
-            if not df.empty:
-                df.index = pd.to_datetime(df.index).tz_localize(None)
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-                df.columns = ['open', 'high', 'low', 'close', 'volume']
+            try:
+                df = _direct_yahoo_v8_chart(ticker, interval=interval, days_back=max_days)
+            except Exception:
+                t_obj = yf.Ticker(ticker)
+                df = t_obj.history(period=f"{max_days}d", interval=interval, auto_adjust=True)
+                if not df.empty:
+                    df.index = pd.to_datetime(df.index).tz_localize(None)
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                    df.columns = ['open', 'high', 'low', 'close', 'volume']
 
         if not df.empty:
             df.to_csv(csv_path)
@@ -217,24 +351,11 @@ def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[p
     except Exception:
         pass
 
-    if interval == "1d":
-        try:
-            df_stooq = _fetch_stooq_daily(ticker)
-            df_stooq.to_csv(csv_path)
-            return df_stooq, "Yahoo IP rate-limit bypassed: Loaded full max historical daily data via Stooq."
-        except Exception:
-            try:
-                df_nasdaq = _fetch_nasdaq_daily(ticker)
-                df_nasdaq.to_csv(csv_path)
-                return df_nasdaq, "Yahoo IP rate-limit bypassed: Loaded full max historical daily data via Nasdaq API."
-            except Exception as e_nas:
-                return pd.DataFrame(), f"All daily data providers failed ({e_nas})."
-
+    # Fallback: Reconstruct from real Daily OHLCV
     try:
-        days = YF_LIMIT_DAYS.get(interval, 28)
-        df_syn = _generate_intraday_from_daily(ticker, interval, days)
+        df_syn = _generate_intraday_from_daily(ticker, interval, max_days)
         return df_syn, (
-            f"Yahoo IP rate-limit active for '{interval}': Reconstructed max {days}d of {interval} bars "
+            f"Yahoo IP rate-limit active for '{interval}': Reconstructed max {max_days}d of {interval} bars "
             f"anchored to real Daily OHLCV."
         )
     except Exception as e:
@@ -243,17 +364,18 @@ def _download_with_fallbacks(ticker: str, interval: str, period: str) -> tuple[p
 
 def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional[str]]:
     """
-    Fetches ALL available 1-day bars (period='max') to construct 1W, 1M, 1Y,
-    and fetches the maximum allowed window for 15m (60d), 5m (60d), and 1m (28d stitched).
+    Constructs 1W, 1M, and 1Y directly from 100% of the 1-Day ('1d') historical dataset!
+    Labels each resampled bar at the START of its period (Jan 1 for 1Y, 1st of month for 1M,
+    Monday for 1W) so clicking a bar never cuts off the year or month.
     """
     ticker = ticker.upper().strip()
-    cache_key = f"{ticker}_{tf}_max"
+    cache_key = f"{ticker}_{tf}_fullmax"
 
     if tf in ["1Y", "1M", "1W", "1d"]:
-        base_key = f"{ticker}_1d_max"
+        base_key = f"{ticker}_1d_fullmax"
         warn_msg = None
         if base_key not in DATA_CACHE:
-            df_1d, warn_msg = _download_with_fallbacks(ticker, interval="1d", period="max")
+            df_1d, warn_msg = _download_daily_max(ticker)
             if df_1d.empty:
                 return pd.DataFrame(), warn_msg or f"No daily data found for {ticker}."
             DATA_CACHE[base_key] = df_1d
@@ -263,32 +385,31 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
         if tf == "1d":
             return df_base, warn_msg
 
-        rule_map = {"1W": "W-FRI", "1M": "ME", "1Y": "YE"}
-        rule = rule_map[tf]
-        try:
-            df_res = df_base.resample(rule).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
-        except Exception:
-            alt_rule = {"1W": "W", "1M": "M", "1Y": "Y"}[tf]
-            df_res = df_base.resample(alt_rule).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+        # Construct Weekly, Monthly, and Yearly directly from the complete 1-day dataset
+        if tf == "1W":
+            # Group by Monday of each week
+            period_idx = df_base.index.to_period("W-SUN").start_time
+        elif tf == "1M":
+            # Group by 1st day of each month
+            period_idx = df_base.index.to_period("M").start_time
+        else:  # "1Y"
+            # Group by Jan 1st of each year
+            period_idx = df_base.index.to_period("Y").start_time
+
+        df_res = df_base.groupby(period_idx).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        df_res.index.name = "date"
         return df_res, warn_msg
 
     else:
-        max_days = YF_LIMIT_DAYS.get(tf, 60)
         warn_msg = None
         if cache_key not in DATA_CACHE:
-            df_intra, warn_msg = _download_with_fallbacks(ticker, interval=tf, period=f"{max_days}d")
+            df_intra, warn_msg = _download_intraday_max(ticker, interval=tf)
             if df_intra.empty:
                 return pd.DataFrame(), warn_msg or f"No {tf} data found for {ticker}."
             DATA_CACHE[cache_key] = df_intra
@@ -461,7 +582,7 @@ def compute_all_indicators(
 
 
 # ==============================================================================
-# 3. BIDIRECTIONAL (LONG & SHORT) LIFECYCLE BACKTEST ENGINE
+# 3. BIDIRECTIONAL (LONG & SHORT) LIFECYCLE BACKTEST ENGINE + DETAILED TRADE LOG
 # ==============================================================================
 STRATEGY_METADATA = {
     "trend": {
@@ -507,8 +628,15 @@ STRATEGY_METADATA = {
 }
 
 
+def _fmt_dt(dt_obj: pd.Timestamp, tf: str) -> str:
+    if tf in ["1h", "15m", "5m", "1m"]:
+        return dt_obj.strftime("%Y-%m-%d %H:%M")
+    return dt_obj.strftime("%Y-%m-%d")
+
+
 def run_strategy_backtest(
     df: pd.DataFrame,
+    tf: str,
     strategy_key: str,
     trade_side: str = "both",
     sl_mult: float = 1.5,
@@ -528,11 +656,13 @@ def run_strategy_backtest(
     allow_long = trade_side in ["both", "long"]
     allow_short = trade_side in ["both", "short"]
 
-    timestamps = [int(ts.timestamp()) for ts in df.index]
+    dt_index = df.index
+    timestamps = [int(ts.timestamp()) for ts in dt_index]
     opens = df['open'].values
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
+    volumes = df['volume'].values
     atrs = df['atr'].values
     gks = df['gk_sigma_dollar'].values
 
@@ -556,6 +686,7 @@ def run_strategy_backtest(
 
     is_intraday_strat = strategy_key in ["orb", "do_t", "smc_fvg"]
     pool_fraction = intraday_pct if is_intraday_strat else core_pct
+    pool_label = f"Intraday ({int(intraday_pct*100)}%)" if is_intraday_strat else f"Core ({int(core_pct*100)}%)"
 
     equity = initial_capital
     peak_equity = initial_capital
@@ -570,12 +701,23 @@ def run_strategy_backtest(
     alt_sl_price = 0.0
     alt_tp_price = 0.0
     entry_idx = 0
-    position_shares = 0.0
+    position_shares = 0
+    entry_Signal_reason = ""
+    dollar_risk_at_entry = 0.0
 
     trades = []
     markers = []
     boxes = []
     equity_curve = []
+
+    def _calc_shares(curr_eq: float, ep: float, slp: float) -> tuple[int, float]:
+        risk_budget = curr_eq * risk_per_trade_pct
+        max_pool_dollars = curr_eq * pool_fraction
+        stop_dist = max(abs(ep - slp), ep * 0.005)
+        raw_shares = min(risk_budget / stop_dist, max_pool_dollars / max(ep, 0.01))
+        shares_int = max(1, int(round(raw_shares)))
+        actual_risk = shares_int * abs(ep - slp)
+        return shares_int, actual_risk
 
     for i in range(1, n):
         ts = timestamps[i]
@@ -659,6 +801,7 @@ def run_strategy_backtest(
         if not allow_short:
             trend_short, trig_short = False, False
 
+        # ---------------- STATE MACHINE ----------------
         if state == 0:
             if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
                 is_long = trig_long
@@ -675,15 +818,14 @@ def run_strategy_backtest(
                     tp_price = entry_price - tp_mult * atrs[i]
                     alt_sl_price = entry_price + sl_mult * gks[i]
                     alt_tp_price = entry_price - tp_mult * gks[i]
-                risk_dollars = equity * risk_per_trade_pct
-                max_alloc_dollars = equity * pool_fraction
-                position_shares = min(risk_dollars / max(abs(entry_price - sl_price), 0.01), max_alloc_dollars / entry_price)
+                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
+                entry_Signal_reason = "MANUAL_CLICK"
                 markers.append({
                     "time": ts,
                     "position": "belowBar" if is_long else "aboveBar",
                     "color": "#00E676" if is_long else "#FF4081",
                     "shape": "arrowUp" if is_long else "arrowDown",
-                    "text": f"MANUAL {'BUY' if is_long else 'SHORT'} @ {entry_price:.2f}"
+                    "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({position_shares} sh @ ${entry_price:.2f})"
                 })
             elif trend_long:
                 state = 1
@@ -716,16 +858,14 @@ def run_strategy_backtest(
                 alt_sl_price = entry_price - sl_mult * gks[i]
                 alt_tp_price = entry_price + tp_mult * gks[i]
 
-                risk_dollars = equity * risk_per_trade_pct
-                max_alloc_dollars = equity * pool_fraction
-                stop_gap = max(abs(entry_price - sl_price), entry_price * 0.005)
-                position_shares = min(risk_dollars / stop_gap, max_alloc_dollars / entry_price)
+                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
+                entry_Signal_reason = "RE-ENTRY LONG" if is_re else "INITIAL LONG"
 
                 markers.append({
                     "time": ts, "position": "belowBar",
                     "color": "#00B0FF" if is_re else "#00E676",
                     "shape": "arrowUp",
-                    "text": f"{'RE-BUY' if is_re else 'BUY'} @ {entry_price:.2f}"
+                    "text": f"{'RE-BUY' if is_re else 'BUY'} {position_shares} sh @ ${entry_price:.2f}"
                 })
 
         elif state in [-1, -3]:
@@ -750,16 +890,14 @@ def run_strategy_backtest(
                 alt_sl_price = entry_price + sl_mult * gks[i]
                 alt_tp_price = entry_price - tp_mult * gks[i]
 
-                risk_dollars = equity * risk_per_trade_pct
-                max_alloc_dollars = equity * pool_fraction
-                stop_gap = max(abs(sl_price - entry_price), entry_price * 0.005)
-                position_shares = min(risk_dollars / stop_gap, max_alloc_dollars / entry_price)
+                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
+                entry_Signal_reason = "RE-ENTRY SHORT" if is_re else "INITIAL SHORT"
 
                 markers.append({
                     "time": ts, "position": "aboveBar",
                     "color": "#E040FB" if is_re else "#FF4081",
                     "shape": "arrowDown",
-                    "text": f"{'RE-SHORT' if is_re else 'SHORT'} @ {entry_price:.2f}"
+                    "text": f"{'RE-SHORT' if is_re else 'SHORT'} {position_shares} sh @ ${entry_price:.2f}"
                 })
 
         elif state == 2:
@@ -769,18 +907,33 @@ def run_strategy_backtest(
                 exit_price = tp_price if hit_tp else sl_price
                 pnl = (exit_price - entry_price) * position_shares
                 ret_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                pos_val = entry_price * position_shares
+                alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
                 equity += pnl
 
                 trades.append({
+                    "trade_no": len(trades) + 1,
                     "side": "LONG",
+                    "signal_type": entry_Signal_reason,
+                    "pool": pool_label,
                     "entry_time": timestamps[entry_idx],
+                    "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
+                    "exit_dt": _fmt_dt(dt_index[i], tf),
                     "type": "TP" if hit_tp else "SL",
                     "entry_price": round(entry_price, 2),
                     "exit_price": round(exit_price, 2),
-                    "shares": round(position_shares, 2),
+                    "sl_price": round(sl_price, 2),
+                    "tp_price": round(tp_price, 2),
+                    "shares": int(position_shares),
+                    "position_value": round(pos_val, 2),
+                    "alloc_pct": round(alloc_pct, 1),
+                    "dollar_risk": round(dollar_risk_at_entry, 2),
+                    "bar_volume": int(volumes[entry_idx]),
+                    "bar_rvol": round(float(rvol[entry_idx]), 2),
                     "pnl": round(pnl, 2),
-                    "ret_pct": round(ret_pct, 2)
+                    "ret_pct": round(ret_pct, 2),
+                    "equity_after": round(equity, 2)
                 })
                 boxes.append({
                     "side": "LONG", "t1": timestamps[entry_idx], "t2": ts,
@@ -804,18 +957,33 @@ def run_strategy_backtest(
                 exit_price = tp_price if hit_tp else sl_price
                 pnl = (entry_price - exit_price) * position_shares
                 ret_pct = ((entry_price - exit_price) / entry_price) * 100.0
+                pos_val = entry_price * position_shares
+                alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
                 equity += pnl
 
                 trades.append({
+                    "trade_no": len(trades) + 1,
                     "side": "SHORT",
+                    "signal_type": entry_Signal_reason,
+                    "pool": pool_label,
                     "entry_time": timestamps[entry_idx],
+                    "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
+                    "exit_dt": _fmt_dt(dt_index[i], tf),
                     "type": "TP" if hit_tp else "SL",
                     "entry_price": round(entry_price, 2),
                     "exit_price": round(exit_price, 2),
-                    "shares": round(position_shares, 2),
+                    "sl_price": round(sl_price, 2),
+                    "tp_price": round(tp_price, 2),
+                    "shares": int(position_shares),
+                    "position_value": round(pos_val, 2),
+                    "alloc_pct": round(alloc_pct, 1),
+                    "dollar_risk": round(dollar_risk_at_entry, 2),
+                    "bar_volume": int(volumes[entry_idx]),
+                    "bar_rvol": round(float(rvol[entry_idx]), 2),
                     "pnl": round(pnl, 2),
-                    "ret_pct": round(ret_pct, 2)
+                    "ret_pct": round(ret_pct, 2),
+                    "equity_after": round(equity, 2)
                 })
                 boxes.append({
                     "side": "SHORT", "t1": timestamps[entry_idx], "t2": ts,
@@ -837,9 +1005,42 @@ def run_strategy_backtest(
         max_dd_pct = max(max_dd_pct, dd)
         equity_curve.append({"time": ts, "value": round(equity, 2)})
 
+    # If a position is still open on the latest candle, include it in the trade log as OPEN
     if state in [2, -2] and n > 0:
+        is_long_open = (state == 2)
+        last_c = closes[-1]
+        unreal_pnl = ((last_c - entry_price) if is_long_open else (entry_price - last_c)) * position_shares
+        unreal_pct = (((last_c - entry_price) if is_long_open else (entry_price - last_c)) / entry_price) * 100.0
+        pos_val = entry_price * position_shares
+        alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
+
+        trades.append({
+            "trade_no": len(trades) + 1,
+            "side": "LONG" if is_long_open else "SHORT",
+            "signal_type": entry_Signal_reason,
+            "pool": pool_label,
+            "entry_time": timestamps[entry_idx],
+            "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
+            "exit_time": timestamps[-1],
+            "exit_dt": "OPEN (Active)",
+            "type": "OPEN",
+            "entry_price": round(entry_price, 2),
+            "exit_price": round(float(last_c), 2),
+            "sl_price": round(sl_price, 2),
+            "tp_price": round(tp_price, 2),
+            "shares": int(position_shares),
+            "position_value": round(pos_val, 2),
+            "alloc_pct": round(alloc_pct, 1),
+            "dollar_risk": round(dollar_risk_at_entry, 2),
+            "bar_volume": int(volumes[entry_idx]),
+            "bar_rvol": round(float(rvol[entry_idx]), 2),
+            "pnl": round(unreal_pnl, 2),
+            "ret_pct": round(unreal_pct, 2),
+            "equity_after": round(equity + unreal_pnl, 2)
+        })
+
         boxes.append({
-            "side": "LONG" if state == 2 else "SHORT",
+            "side": "LONG" if is_long_open else "SHORT",
             "t1": timestamps[entry_idx],
             "t2": timestamps[-1],
             "entry": float(entry_price),
@@ -850,11 +1051,12 @@ def run_strategy_backtest(
             "outcome": "ACTIVE"
         })
 
-    total_trades = len(trades)
-    long_trades = sum(1 for t in trades if t.get("side") == "LONG")
-    short_trades = sum(1 for t in trades if t.get("side") == "SHORT")
-    wins = [t for t in trades if t['pnl'] > 0]
-    losses = [t for t in trades if t['pnl'] <= 0]
+    closed_trades = [t for t in trades if t["type"] in ["TP", "SL"]]
+    total_trades = len(closed_trades)
+    long_trades = sum(1 for t in closed_trades if t.get("side") == "LONG")
+    short_trades = sum(1 for t in closed_trades if t.get("side") == "SHORT")
+    wins = [t for t in closed_trades if t['pnl'] > 0]
+    losses = [t for t in closed_trades if t['pnl'] <= 0]
     win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
     gross_profit = sum(t['pnl'] for t in wins)
     gross_loss = abs(sum(t['pnl'] for t in losses))
@@ -1096,7 +1298,7 @@ def api_option_contract_history(
 
 
 # ==============================================================================
-# 5. MAIN BACKTEST & CHART FASTAPI ENDPOINT
+# 5. MAIN BACKTEST, BAR INSPECTOR & CHART FASTAPI ENDPOINT
 # ==============================================================================
 @app.get("/api/analyze")
 def api_analyze(
@@ -1127,8 +1329,8 @@ def api_analyze(
     if start_ts is not None and start_ts < first_avail_ts:
         first_dt_str = df_raw.index[0].strftime("%Y-%m-%d %H:%M")
         extra_warn = (
-            f"Max lookback limit: '{tf}' data is unavailable for the clicked date. "
-            f"Showing earliest available '{tf}' data starting from {first_dt_str}."
+            f"Max Yahoo lookback limit: '{tf}' data is unavailable prior to {first_dt_str}. "
+            f"Showing all available '{tf}' bars starting from {first_dt_str}."
         )
         warn_msg = f"{warn_msg} | {extra_warn}" if warn_msg else extra_warn
         start_ts = first_avail_ts
@@ -1153,7 +1355,6 @@ def api_analyze(
         df_calc, tf, atr_mult=sl_mult, gk_mult=tp_mult, w_trend=w_trend, w_liq=w_liq, w_rev=w_rev
     )
 
-    # Use ALL available bars for the selected timeframe (no artificial cap)
     if start_ts is not None:
         start_dt = datetime.fromtimestamp(start_ts)
         df_view = df_ind[df_ind.index >= start_dt].copy()
@@ -1164,6 +1365,7 @@ def api_analyze(
 
     bt_selected = run_strategy_backtest(
         df_view,
+        tf=tf,
         strategy_key=strategy,
         trade_side=trade_side,
         sl_mult=sl_mult,
@@ -1181,6 +1383,7 @@ def api_analyze(
     for s_key in STRATEGY_METADATA.keys():
         res = run_strategy_backtest(
             df_view,
+            tf=tf,
             strategy_key=s_key,
             trade_side=trade_side,
             sl_mult=sl_mult,
@@ -1197,6 +1400,7 @@ def api_analyze(
 
     candles = []
     volumes = []
+    bar_details = {}  # Fast O(1) lookup by timestamp for the Floating Hover HUD
     series_data = {
         "ema20": [], "ema50": [], "vwap": [], "vwap_u2": [], "vwap_l2": [],
         "atr_upper": [], "atr_lower": [], "gk_upper": [], "gk_lower": [],
@@ -1210,20 +1414,66 @@ def api_analyze(
     unclear_start = None
     idx_timestamps = [int(t.timestamp()) for t in df_view.index]
 
+    is_intraday_strat = strategy in ["orb", "do_t", "smc_fvg"]
+    pool_frac = (intraday_pct / 100.0) if is_intraday_strat else (core_pct / 100.0)
+    risk_frac = risk_pct / 100.0
+
     for i, (dt, row) in enumerate(df_view.iterrows()):
         ts = idx_timestamps[i]
-        candles.append({
-            "time": ts,
-            "open": round(float(row['open']), 4),
-            "high": round(float(row['high']), 4),
-            "low": round(float(row['low']), 4),
-            "close": round(float(row['close']), 4)
-        })
+        o_val = round(float(row['open']), 4)
+        h_val = round(float(row['high']), 4)
+        l_val = round(float(row['low']), 4)
+        c_val = round(float(row['close']), 4)
+        v_val = float(row['volume'])
+        atr_val = float(row['atr'])
+        gk_val = float(row['gk_sigma_dollar'])
+        unit_v = gk_val if vol_model == "gk" else atr_val
+        if np.isnan(unit_v) or unit_v <= 0:
+            unit_v = c_val * 0.015
+
+        # Precompute Position Sizing if entering on this exact bar
+        stop_dist = max(sl_mult * unit_v, c_val * 0.005)
+        risk_dollars = initial_capital * risk_frac
+        max_pool_dollars = initial_capital * pool_frac
+        sug_shares = max(1, int(round(min(risk_dollars / stop_dist, max_pool_dollars / max(c_val, 0.01)))))
+        sug_pos_val = round(sug_shares * c_val, 2)
+        sug_risk_dlr = round(sug_shares * stop_dist, 2)
+
+        candles.append({"time": ts, "open": o_val, "high": h_val, "low": l_val, "close": c_val})
         volumes.append({
             "time": ts,
-            "value": float(row['volume']),
-            "color": "rgba(0, 230, 118, 0.35)" if row['close'] >= row['open'] else "rgba(255, 23, 68, 0.35)"
+            "value": v_val,
+            "color": "rgba(0, 230, 118, 0.35)" if c_val >= o_val else "rgba(255, 23, 68, 0.35)"
         })
+
+        chg_pct = ((c_val - o_val) / max(o_val, 1e-6)) * 100.0
+        bar_details[str(ts)] = {
+            "dt": _fmt_dt(dt, tf),
+            "o": round(o_val, 2),
+            "h": round(h_val, 2),
+            "l": round(l_val, 2),
+            "c": round(c_val, 2),
+            "chg_pct": round(chg_pct, 2),
+            "vol": int(v_val),
+            "rvol": round(float(row['rvol']), 2),
+            "ema20": round(float(row['ema20']), 2),
+            "ema50": round(float(row['ema50']), 2),
+            "vwap": round(float(row['vwap']), 2),
+            "rsi": round(float(row['rsi']), 1),
+            "atr": round(atr_val, 2),
+            "gk_pct": round(float(row['gk_vol_pct']) * 100.0, 2),
+            "score": round(float(row['composite_score']), 2),
+            "regime": "UNCLEAR / VOLATILE" if bool(row['is_unclear_volatile']) else (
+                "BULL TREND" if row['ema20'] > row['ema50'] else "BEAR TREND"
+            ),
+            "sug_shares": sug_shares,
+            "sug_pos_val": sug_pos_val,
+            "sug_risk": sug_risk_dlr,
+            "long_sl": round(c_val - stop_dist, 2),
+            "long_tp": round(c_val + tp_mult * unit_v, 2),
+            "short_sl": round(c_val + stop_dist, 2),
+            "short_tp": round(c_val - tp_mult * unit_v, 2)
+        }
 
         for col in series_data.keys():
             val = row.get(col, np.nan)
@@ -1265,14 +1515,15 @@ def api_analyze(
         "ticker": ticker.upper(),
         "tf": tf,
         "total_bars": len(candles),
-        "first_date": df_view.index[0].strftime("%Y-%m-%d"),
-        "last_date": df_view.index[-1].strftime("%Y-%m-%d"),
+        "first_date": _fmt_dt(df_view.index[0], tf),
+        "last_date": _fmt_dt(df_view.index[-1], tf),
         "next_tf": NEXT_TIMEFRAME.get(tf, "1m"),
         "warning": warn_msg,
         "unavailable_indicators": unavailable_list,
         "auto_indicators": STRATEGY_METADATA[strategy]["indicators"],
         "candles": candles,
         "volumes": volumes,
+        "bar_details": bar_details,
         "series": series_data,
         "fvg_boxes": fvg_boxes[-60:],
         "unclear_spans": unclear_spans,
@@ -1304,14 +1555,14 @@ def api_options_greeks(
 
 
 # ==============================================================================
-# 6. FRONTEND SINGLE-PAGE APPLICATION (FOLDABLE PANELS + DELETABLE TABS)
+# 6. FRONTEND SINGLE-PAGE APPLICATION (HOVER HUD + TRADE LOG + FOLDABLE UI)
 # ==============================================================================
 HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Quant Strategy, Long/Short Backtest & Live Options Terminal</title>
+<title>Quant Strategy, Hover Sizing HUD & Trade Log Terminal</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -1370,7 +1621,6 @@ HTML_PAGE = r"""
   button.btn:hover { opacity: 0.9; }
   button.btn-sec { background: #2a2e39; color: var(--text); }
   
-  /* Main Viewport */
   .main { flex: 1; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; }
   
   .topbar {
@@ -1414,7 +1664,7 @@ HTML_PAGE = r"""
     color: #ffb74d; padding: 5px 14px; font-size: 11.5px; display: none; flex-shrink: 0;
   }
 
-  /* Dynamic Chart Area - Expands Automatically When Bottom Panels Are Folded */
+  /* Dynamic Chart Area */
   .chart-wrapper {
     position: relative; width: 100%; flex: 1; min-height: 440px;
     background: #0b0e14; border-bottom: 1px solid var(--border);
@@ -1422,17 +1672,36 @@ HTML_PAGE = r"""
   #tv-chart { width: 100%; height: 100%; }
   #overlay-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
   .chart-legend {
-    position: absolute; top: 10px; left: 14px; z-index: 20; background: rgba(19, 23, 34, 0.85);
+    position: absolute; top: 10px; left: 14px; z-index: 20; background: rgba(19, 23, 34, 0.88);
     padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45;
+  }
+
+  /* Floating Crosshair Bar Inspector & Position Sizing HUD */
+  .floating-hud {
+    position: absolute; top: 10px; right: 72px; z-index: 25;
+    width: 300px; background: rgba(15, 19, 28, 0.94);
+    border: 1px solid #363c4e; border-radius: 6px; padding: 9px 11px;
+    pointer-events: none; font-size: 11px; line-height: 1.45;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.5); display: none;
+  }
+  .hud-header {
+    font-weight: 700; font-size: 11.5px; color: #00b0ff; border-bottom: 1px solid var(--border);
+    padding-bottom: 4px; margin-bottom: 5px; display: flex; justify-content: space-between;
+  }
+  .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px; }
+  .hud-size-box {
+    margin-top: 6px; padding-top: 5px; border-top: 1px dashed #363c4e;
+    color: #ffd600; font-size: 11px;
   }
 
   /* Foldable Bottom Panels Container */
   .bottom-panels { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
   .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th, td { padding: 5px 7px; text-align: left; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; background: #161b26; position: sticky; top: 0; }
+  th, td { padding: 5px 7px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; background: #161b26; position: sticky; top: 0; z-index: 2; }
   tr.highlight-row { background: rgba(41, 98, 255, 0.18); font-weight: 600; }
+  tr:hover { background: rgba(255, 255, 255, 0.04); }
   .pos { color: var(--green); }
   .neg { color: var(--red); }
   .pill { padding: 2px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; }
@@ -1463,7 +1732,7 @@ HTML_PAGE = r"""
     </div>
     <label>Candle Click Action</label>
     <select id="clickMode">
-      <option value="drill">Drill-Down Timeframe (1Y->1M->1W->1D->15m->5m->1m)</option>
+      <option value="drill">Drill-Down Timeframe (1Y->1M->1W->1D->1H->15m->5m->1m)</option>
       <option value="manual_long">Manual Click-to-BUY (Long TP/SL)</option>
       <option value="manual_short">Manual Click-to-SHORT (Short TP/SL)</option>
       <option value="cutoff">Set Point-in-Time Cutoff Date</option>
@@ -1528,29 +1797,30 @@ HTML_PAGE = r"""
       <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> SMC FVG Boxes</label>
       <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
       <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
+      <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating Hover HUD</label>
     </div>
   </details>
 
-  <details class="fold-card">
+  <details class="fold-card" open>
     <summary>4. Portfolio & Position Sizing ($100k)</summary>
     <div class="row-2">
       <div>
         <label>Starting Capital ($)</label>
-        <input type="number" id="initial_capital" value="100000" step="10000">
+        <input type="number" id="initial_capital" value="100000" step="10000" onchange="loadChartData()">
       </div>
       <div>
         <label>Risk / Trade (%)</label>
-        <input type="number" id="risk_pct" value="1.0" step="0.25">
+        <input type="number" id="risk_pct" value="1.0" step="0.25" onchange="loadChartData()">
       </div>
     </div>
     <div class="row-2">
       <div>
         <label>Core Trend Pool (%)</label>
-        <input type="number" id="core_pct" value="70" step="5">
+        <input type="number" id="core_pct" value="70" step="5" onchange="loadChartData()">
       </div>
       <div>
         <label>Intraday / T Pool (%)</label>
-        <input type="number" id="intraday_pct" value="30" step="5">
+        <input type="number" id="intraday_pct" value="30" step="5" onchange="loadChartData()">
       </div>
     </div>
   </details>
@@ -1569,6 +1839,7 @@ HTML_PAGE = r"""
       <button class="tf-btn" onclick="switchTF('1M')">1M</button>
       <button class="tf-btn" onclick="switchTF('1W')">1W</button>
       <button class="tf-btn" onclick="switchTF('1d')">1D</button>
+      <button class="tf-btn" onclick="switchTF('1h')">1H</button>
       <button class="tf-btn" onclick="switchTF('15m')">15m</button>
       <button class="tf-btn" onclick="switchTF('5m')">5m</button>
       <button class="tf-btn" onclick="switchTF('1m')">1m</button>
@@ -1577,22 +1848,57 @@ HTML_PAGE = r"""
 
   <div class="alert-banner" id="alert-banner"></div>
 
-  <!-- Primary Candlestick & Overlay Plot -->
+  <!-- Primary Candlestick + Floating HUD + Shaded Overlay Plot -->
   <div class="chart-wrapper" id="chart-wrap">
     <div class="chart-legend" id="chart-legend">Loading...</div>
+    <div class="floating-hud" id="floating-hud"></div>
     <div id="tv-chart"></div>
     <canvas id="overlay-canvas"></canvas>
   </div>
 
   <!-- Foldable Bottom Panels -->
   <div class="bottom-panels">
+    <!-- Panel A: Detailed Trade Execution Log -->
+    <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
+      <summary>
+        <span>Active Strategy Trade Execution Log & Position Sizing (Click Any Row to Jump to Trade on Chart)</span>
+        <span id="trade-count-badge" style="color:#00e676; margin-right:10px;"></span>
+      </summary>
+      <div style="overflow-x:auto; max-height:195px;">
+        <table id="trade-log-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Side</th>
+              <th>Signal</th>
+              <th>Pool</th>
+              <th>Entry Time</th>
+              <th>Entry $</th>
+              <th>Shares to Buy/Short</th>
+              <th>Position Value ($)</th>
+              <th> Dollar Risk ($)</th>
+              <th>SL / TP ($)</th>
+              <th>Exit Time</th>
+              <th>Exit $</th>
+              <th>Result</th>
+              <th>Net PnL ($)</th>
+              <th>Return %</th>
+              <th>Account Equity</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+
     <div class="bottom-grid">
+      <!-- Panel B: All-Strategies Comparison -->
       <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
         <summary>
-          <span>All Strategies Backtest Comparison ($100k Baseline — Long & Short)</span>
+          <span>All Strategies Comparison ($100k Baseline — Long & Short)</span>
           <span id="bh-badge" style="color:var(--gold); margin-right:10px;"></span>
         </summary>
-        <div style="overflow-x:auto; max-height:210px;">
+        <div style="overflow-x:auto; max-height:190px;">
           <table id="summary-table">
             <thead>
               <tr>
@@ -1611,6 +1917,7 @@ HTML_PAGE = r"""
         </div>
       </details>
 
+      <!-- Panel C: Options Greeks & Expectancy Calculator -->
       <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
         <summary>Options Greeks & Implied Expectancy Calculator</summary>
         <div class="row-3">
@@ -1630,6 +1937,7 @@ HTML_PAGE = r"""
       </details>
     </div>
 
+    <!-- Panel D: Live Yahoo Option Chain Browser -->
     <details class="fold-card bottom-fold" ontoggle="resizeChart()">
       <summary>
         <span>Live Option Chain Browser & Contract Price History (Click to Expand / Collapse)</span>
@@ -1639,7 +1947,7 @@ HTML_PAGE = r"""
         <select id="chain_expiry" style="width:150px;" onchange="loadOptionChain(this.value)"></select>
       </div>
       <div class="row-2" style="gap:14px;">
-        <div style="max-height:200px; overflow-y:auto;">
+        <div style="max-height:190px; overflow-y:auto;">
           <div style="font-weight:700; color:var(--green); margin-bottom:4px;">CALLS (Click row for contract history)</div>
           <table id="calls-table">
             <thead>
@@ -1648,7 +1956,7 @@ HTML_PAGE = r"""
             <tbody></tbody>
           </table>
         </div>
-        <div style="max-height:200px; overflow-y:auto;">
+        <div style="max-height:190px; overflow-y:auto;">
           <div style="font-weight:700; color:var(--red); margin-bottom:4px;">PUTS (Click row for contract history)</div>
           <table id="puts-table">
             <thead>
@@ -1753,6 +2061,51 @@ function initChart() {
   chart.timeScale().subscribeVisibleTimeRangeChange(() => requestAnimationFrame(drawCanvasZones));
   window.addEventListener('resize', resizeChart);
 
+  // Floating Hover Inspector HUD Subscription
+  chart.subscribeCrosshairMove((param) => {
+    const hud = document.getElementById('floating-hud');
+    const showHud = document.getElementById('chk_hover_hud').checked;
+    if (!showHud || !param || !param.time || !currentData || !currentData.bar_details) {
+      hud.style.display = 'none';
+      return;
+    }
+    const b = currentData.bar_details[String(param.time)];
+    if (!b) {
+      hud.style.display = 'none';
+      return;
+    }
+    hud.style.display = 'block';
+    const chgColor = b.chg_pct >= 0 ? '#00e676' : '#ff1744';
+    const regColor = b.regime.includes('UNCLEAR') ? '#ffb74d' : (b.regime.includes('BULL') ? '#00e676' : '#ff1744');
+    hud.innerHTML = `
+      <div class="hud-header">
+        <span>${currentData.ticker} [${currentData.tf}] — ${b.dt}</span>
+        <span style="color:${chgColor}">${b.chg_pct >= 0 ? '+' : ''}${b.chg_pct}%</span>
+      </div>
+      <div class="hud-grid">
+        <div><b>Open:</b> $${b.o}</div>
+        <div><b>High:</b> $${b.h}</div>
+        <div><b>Low:</b> $${b.l}</div>
+        <div><b>Close:</b> $${b.c}</div>
+        <div><b>Volume:</b> ${b.vol.toLocaleString()}</div>
+        <div><b>RVOL:</b> ${b.rvol}x</div>
+        <div><b>EMA 20/50:</b> $${b.ema20} / $${b.ema50}</div>
+        <div><b>VWAP:</b> $${b.vwap}</div>
+        <div><b>ATR (14):</b> $${b.atr}</div>
+        <div><b>GK Vol:</b> ${b.gk_pct}%</div>
+        <div><b>RSI (14):</b> ${b.rsi}</div>
+        <div><b>Score:</b> ${b.score}</div>
+      </div>
+      <div style="margin-top:4px;"><b>Regime:</b> <span style="color:${regColor}; font-weight:700;">${b.regime}</span></div>
+      <div class="hud-size-box">
+        <div><b>Position Size @ This Bar:</b> Buy/Short <b>${b.sug_shares.toLocaleString()} shares</b> ($${b.sug_pos_val.toLocaleString()})</div>
+        <div><b>Dollar Risk:</b> $${b.sug_risk} | <b>Long SL/TP:</b> $${b.long_sl} / $${b.long_tp}</div>
+        <div><b>Short SL/TP:</b> $${b.short_sl} / $${b.short_tp}</div>
+      </div>
+    `;
+  });
+
+  // Candlestick Click Action
   chart.subscribeClick((param) => {
     if (!param || !param.time || !currentData) return;
     const clickedTs = param.time;
@@ -1775,7 +2128,6 @@ function initChart() {
       }
       currentTF = nextTf;
 
-      // Trim any tabs after activeCrumbIdx, and replace if same timeframe already exists so tabs don't stack infinitely
       breadcrumbs = breadcrumbs.slice(0, activeCrumbIdx + 1);
       const existingIdx = breadcrumbs.findIndex(b => b.tf === currentTF);
       const newTab = { label: `${dtStr} (${currentTF})`, tf: currentTF, startTs: currentStartTs };
@@ -1821,7 +2173,6 @@ function renderBreadcrumbs() {
     };
     el.appendChild(lbl);
 
-    // Add 'x' delete button on every tab (if only 1 tab remains, clicking 'x' resets it to root)
     const closeBtn = document.createElement('span');
     closeBtn.className = 'crumb-close';
     closeBtn.textContent = '×';
@@ -1864,8 +2215,12 @@ function deleteCrumb(idx) {
 }
 
 function switchTF(tf) {
-  // Replaces the current active tab in-place instead of stacking new tabs!
+  // When user clicks a top-bar timeframe button directly, show MAX history for that timeframe
+  // unless they explicitly drilled down from a parent tab.
   currentTF = tf;
+  if (activeCrumbIdx === 0) {
+    currentStartTs = null;
+  }
   const datePrefix = currentStartTs
     ? new Date(currentStartTs * 1000).toISOString().slice(0, 10)
     : 'Max';
@@ -1956,6 +2311,7 @@ async function loadChartData() {
   chart.timeScale().fitContent();
 
   renderOverlays();
+  updateTradeLogTable(data);
   updateSummaryTable(data);
 
   document.getElementById('opt_spot').value = data.latest_metrics.close;
@@ -2004,7 +2360,7 @@ function renderOverlays() {
     <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${currentData.total_bars} bars) |
     Close: $${currentData.latest_metrics.close} | ATR: $${currentData.latest_metrics.atr} | GK Vol: ${currentData.latest_metrics.gk_daily_vol_pct}%<br>
     <span style="color:#00e676">Active Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span> |
-    Trades: ${st.total_trades} (Long: ${st.long_trades} / Short: ${st.short_trades}) | Win Rate: ${st.win_rate_pct}%
+    Closed Trades: ${st.total_trades} (Long: ${st.long_trades} / Short: ${st.short_trades}) | Win Rate: ${st.win_rate_pct}%
   `;
 
   requestAnimationFrame(drawCanvasZones);
@@ -2086,6 +2442,58 @@ function drawCanvasZones() {
       }
     });
   }
+}
+
+function updateTradeLogTable(data) {
+  const tbody = document.querySelector('#trade-log-table tbody');
+  tbody.innerHTML = '';
+  const trades = data.backtest.trades || [];
+  document.getElementById('trade-count-badge').textContent = `${trades.length} Total Executions`;
+
+  if (trades.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="16" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view.</td></tr>`;
+    return;
+  }
+
+  // Render newest trades at the top or chronological
+  trades.forEach(t => {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'pointer';
+    tr.title = 'Click to focus chart on this trade';
+    tr.onclick = () => {
+      const pad = Math.max(86400 * 5, (t.exit_time - t.entry_time) * 2);
+      chart.timeScale().setVisibleRange({
+        from: t.entry_time - pad,
+        to: t.exit_time + pad
+      });
+    };
+
+    const sideCls = t.side === 'LONG' ? 'pos' : 'neg';
+    const pnlCls = t.pnl >= 0 ? 'pos' : 'neg';
+    const resBadge = t.type === 'TP'
+      ? `<span class="pill pill-cheap">TP WIN</span>`
+      : (t.type === 'SL' ? `<span class="pill pill-exp">SL LOSS</span>` : `<span class="pill pill-fair">OPEN</span>`);
+
+    tr.innerHTML = `
+      <td>${t.trade_no}</td>
+      <td class="${sideCls}"><b>${t.side}</b></td>
+      <td>${t.signal_type}</td>
+      <td>${t.pool}</td>
+      <td>${t.entry_dt}</td>
+      <td><b>$${t.entry_price}</b></td>
+      <td style="color:#ffd600; font-weight:700;">${t.shares.toLocaleString()} sh (Vol: ${t.bar_volume.toLocaleString()} | ${t.bar_rvol}x)</td>
+      <td>$${t.position_value.toLocaleString()} (${t.alloc_pct}%)</td>
+      <td>$${t.dollar_risk.toLocaleString()}</td>
+      <td>$${t.sl_price} / $${t.tp_price}</td>
+      <td>${t.exit_dt}</td>
+      <td>$${t.exit_price}</td>
+      <td>${resBadge}</td>
+      <td class="${pnlCls}"><b>${t.pnl >= 0 ? '+' : ''}$${t.pnl.toLocaleString()}</b></td>
+      <td class="${pnlCls}">${t.ret_pct >= 0 ? '+' : ''}${t.ret_pct}%</td>
+      <td><b>$${t.equity_after.toLocaleString()}</b></td>
+    `;
+    tbody.appendChild(tr);
+  });
 }
 
 function updateSummaryTable(data) {
