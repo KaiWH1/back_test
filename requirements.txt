@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+yfinance
+curl_cffi
+pandas
+numpy
+scipy
+requests
+EOF

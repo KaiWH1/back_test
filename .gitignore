@@ -1,0 +1,6 @@
+.venv/
+venv/
+__pycache__/
+yf_cache/
+.DS_Store
+EOF
