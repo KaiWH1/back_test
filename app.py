@@ -1,6 +1,5 @@
 import os
 import math
-import json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -13,13 +12,13 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Unified Engine (Replay, Live Polling, Dual-Pool, Scale-Out)")
-
+app = FastAPI(title="Quant Lab: EMA 200 Filter, 1m Live Auto-Refresh, 60d Options & Bar-by-Bar Replay")
 
 # ==============================================================================
 # 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
 # ==============================================================================
 def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -> float:
+    """Safely converts any number/numpy scalar to a finite Python float."""
     try:
         f = float(val)
         if math.isnan(f) or math.isinf(f):
@@ -30,6 +29,7 @@ def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -
 
 
 def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively cleans dicts/lists so json.dumps never sees NaN or Infinity."""
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -46,21 +46,35 @@ def _sanitize_for_json(obj: Any) -> Any:
 # 1. DISK + MEMORY CACHE & MAX-LOOKBACK MULTI-SOURCE DATA ENGINE
 # ==============================================================================
 DATA_CACHE: Dict[str, pd.DataFrame] = {}
+DATA_CACHE_TS: Dict[str, float] = {}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 TIMEFRAME_HIERARCHY = ["1Y", "1M", "1W", "1d", "1h", "15m", "5m", "1m"]
 NEXT_TIMEFRAME = {
-    "1Y": "1M", "1M": "1W", "1W": "1d", "1d": "1h",
-    "1h": "15m", "15m": "5m", "5m": "1m", "1m": "1m"
+    "1Y": "1M",
+    "1M": "1W",
+    "1W": "1d",
+    "1d": "1h",
+    "1h": "15m",
+    "15m": "5m",
+    "5m": "1m",
+    "1m": "1m"
 }
 
 YF_LIMIT_DAYS = {
-    "1h": 729, "15m": 59, "5m": 59, "1m": 28
+    "1h": 729,
+    "15m": 59,
+    "5m": 59,
+    "1m": 28
 }
 
 
 def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] = None) -> pd.DataFrame:
+    """
+    Direct query2.finance.yahoo.com/v8/finance/chart fetch using explicit period1 & period2
+    unix timestamps so data NEVER stops early and always reaches today's date.
+    """
     now_ts = int((datetime.now() + timedelta(days=2)).timestamp())
     if days_back is None:
         start_ts = 0
@@ -69,8 +83,11 @@ def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] 
 
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
     params = {
-        "period1": start_ts, "period2": now_ts, "interval": interval,
-        "includePrePost": "false", "events": "div,splits"
+        "period1": start_ts,
+        "period2": now_ts,
+        "interval": interval,
+        "includePrePost": "false",
+        "events": "div,splits"
     }
     headers = {
         "User-Agent": (
@@ -223,6 +240,7 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
                 "close": b_close,
                 "volume": b_vol
             })
+
     return pd.DataFrame(all_rows).set_index("dt")
 
 
@@ -246,6 +264,7 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
             pass
 
     candidates: List[tuple[pd.DataFrame, Optional[str]]] = []
+
     try:
         df_v8 = _direct_yahoo_v8_chart(ticker, interval="1d", days_back=None)
         if not df_v8.empty:
@@ -253,7 +272,8 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
             if _is_data_fresh(df_v8):
                 df_v8.to_csv(csv_path)
                 return df_v8, None
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
         t_obj = yf.Ticker(ticker)
@@ -267,7 +287,8 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
             if _is_data_fresh(df_yf):
                 df_yf.to_csv(csv_path)
                 return df_yf, None
-    except Exception: pass
+    except Exception:
+        pass
 
     try:
         df_stooq = _fetch_stooq_daily(ticker)
@@ -276,7 +297,18 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
             if _is_data_fresh(df_stooq):
                 df_stooq.to_csv(csv_path)
                 return df_stooq, None
-    except Exception: pass
+    except Exception:
+        pass
+
+    try:
+        df_nas = _fetch_nasdaq_daily(ticker)
+        if not df_nas.empty:
+            candidates.append((df_nas, "Loaded full historical daily data via Nasdaq API."))
+            if _is_data_fresh(df_nas):
+                df_nas.to_csv(csv_path)
+                return df_nas, None
+    except Exception:
+        pass
 
     if candidates:
         best_df, best_warn = max(candidates, key=lambda item: (item[0].index[-1], len(item[0])))
@@ -286,17 +318,16 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     return pd.DataFrame(), f"All daily data providers failed for {ticker}."
 
 
-def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Optional[str]]:
+def _download_intraday_max(ticker: str, interval: str, force_refresh: bool = False) -> tuple[pd.DataFrame, Optional[str]]:
     max_days = YF_LIMIT_DAYS.get(interval, 59)
     csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_fullmax.csv")
-    
-    # 1-minute caching is ultra-short to support live polling, other TFs are 2 hours
-    cache_ttl = 0.025 if interval == "1m" else 2.0
-    
-    if os.path.exists(csv_path):
+    # For 1m data, refresh every 55 seconds so 1-minute live updates always get fresh bars
+    ttl_seconds = 55.0 if interval == "1m" else 7200.0
+
+    if not force_refresh and os.path.exists(csv_path):
         try:
-            age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
-            if age_hours < cache_ttl:
+            age_seconds = datetime.now().timestamp() - os.path.getmtime(csv_path)
+            if age_seconds < ttl_seconds:
                 df_disk = pd.read_csv(csv_path, index_col=0, parse_dates=True)
                 if not df_disk.empty:
                     return df_disk, None
@@ -316,7 +347,6 @@ def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Op
                     df.index = pd.to_datetime(df.index).tz_localize(None)
                     df = df[['Open', 'High', 'Low', 'Close', 'Volume']].replace([np.inf, -np.inf], np.nan).dropna()
                     df.columns = ['open', 'high', 'low', 'close', 'volume']
-
         if not df.empty:
             df.to_csv(csv_path)
             return df, None
@@ -333,18 +363,20 @@ def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Op
         return pd.DataFrame(), f"Could not fetch or reconstruct {interval} data: {e}"
 
 
-def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional[str]]:
+def fetch_and_construct_tf(ticker: str, tf: str, force_refresh: bool = False) -> tuple[pd.DataFrame, Optional[str]]:
     ticker = ticker.upper().strip()
     cache_key = f"{ticker}_{tf}_fullmax"
+    now_ts = datetime.now().timestamp()
 
     if tf in ["1Y", "1M", "1W", "1d"]:
         base_key = f"{ticker}_1d_fullmax"
         warn_msg = None
-        if base_key not in DATA_CACHE:
+        if force_refresh or base_key not in DATA_CACHE:
             df_1d, warn_msg = _download_daily_max(ticker)
             if df_1d.empty:
                 return pd.DataFrame(), warn_msg or f"No daily data found for {ticker}."
             DATA_CACHE[base_key] = df_1d
+            DATA_CACHE_TS[base_key] = now_ts
 
         df_base = DATA_CACHE[base_key].copy()
         if tf == "1d":
@@ -358,22 +390,29 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
             period_idx = df_base.index.to_period("Y").start_time
 
         df_res = df_base.groupby(period_idx).agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
         }).dropna()
         df_res.index.name = "date"
         return df_res, warn_msg
     else:
         warn_msg = None
-        if cache_key not in DATA_CACHE or tf == "1m":
-            df_intra, warn_msg = _download_intraday_max(ticker, interval=tf)
+        cache_age = now_ts - DATA_CACHE_TS.get(cache_key, 0.0)
+        ttl = 55.0 if tf == "1m" else 7200.0
+        if force_refresh or (cache_key not in DATA_CACHE) or (cache_age >= ttl):
+            df_intra, warn_msg = _download_intraday_max(ticker, interval=tf, force_refresh=force_refresh)
             if df_intra.empty:
                 return pd.DataFrame(), warn_msg or f"No {tf} data found for {ticker}."
             DATA_CACHE[cache_key] = df_intra
+            DATA_CACHE_TS[cache_key] = now_ts
         return DATA_CACHE[cache_key].copy(), warn_msg
 
 
 # ==============================================================================
-# 2. QUANTITATIVE INDICATORS & DYNAMIC SL/TP FORMULA ENGINE (ZERO-NaN)
+# 2. QUANTITATIVE INDICATORS (WITH EMA 200) & DYNAMIC SL/TP FORMULA ENGINE
 # ==============================================================================
 def compute_all_indicators(
     df: pd.DataFrame,
@@ -388,12 +427,15 @@ def compute_all_indicators(
     df = df.copy()
     n = len(df)
     unavailable_indicators = []
+
     if n == 0:
         return df, ["All Indicators (Empty Data)"]
-
-    if n < 20: unavailable_indicators.append("EMA 20 / Bollinger / GK Cone (< 20 bars in view)")
-    if n < 50: unavailable_indicators.append("EMA 50 (< 50 bars in view)")
-    if n < 200: unavailable_indicators.append("EMA 200 (< 200 bars in view)")
+    if n < 20:
+        unavailable_indicators.append("EMA 20 / Bollinger / GK Cone (< 20 bars in view)")
+    if n < 50:
+        unavailable_indicators.append("EMA 50 (< 50 bars in view)")
+    if n < 200:
+        unavailable_indicators.append("EMA 200 (< 200 bars in view; using adaptive span)")
 
     df['ema20'] = df['close'].ewm(span=20, min_periods=1).mean().bfill().fillna(df['close'])
     df['ema50'] = df['close'].ewm(span=50, min_periods=1).mean().bfill().fillna(df['close'])
@@ -419,7 +461,6 @@ def compute_all_indicators(
 
     typical_price = (df['high'] + df['low'] + df['close']) / 3.0
     tp_vol = typical_price * df['volume']
-
     if tf in ["15m", "5m", "1m"]:
         dates = df.index.date
         cum_tp_vol = tp_vol.groupby(dates).cumsum()
@@ -464,8 +505,11 @@ def compute_all_indicators(
     fvg_bull_retest = np.zeros(n, dtype=bool)
     fvg_bear_retest = np.zeros(n, dtype=bool)
 
-    highs, lows, closes = df['high'].values, df['low'].values, df['close'].values
-    f_bull, f_bear = df['fvg_bull'].values, df['fvg_bear'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+    f_bull = df['fvg_bull'].values
+    f_bear = df['fvg_bear'].values
 
     for i in range(2, n):
         if not np.isnan(active_bull_top):
@@ -518,7 +562,8 @@ def compute_all_indicators(
     rev_norm = np.clip(-vwap_z / 2.5, -1.0, 1.0)
 
     total_w = abs(w_trend) + abs(w_liq) + abs(w_rev)
-    if total_w == 0: total_w = 1.0
+    if total_w == 0:
+        total_w = 1.0
     df['composite_score'] = ((w_trend * slope_norm + w_liq * liq_norm + w_rev * rev_norm) / total_w).fillna(0.0)
 
     ema_diff_ratio = (df['ema20'] - df['ema50']).abs() / df['atr']
@@ -556,52 +601,52 @@ def compute_all_indicators(
 
 
 # ==============================================================================
-# 3. DUAL-POOL PORTFOLIO, SCALE-OUT LADDER, EMA200 FILTER & REPLAY BACKTEST ENGINE
+# 3. DUAL-POOL PORTFOLIO, EMA 200 FILTER, SCALE-OUT LADDER & BACKTEST ENGINE
 # ==============================================================================
 STRATEGY_METADATA = {
     "trend": {
-        "name": "1. Core Trend (EMA 20/50 + Volume)",
-        "indicators": ["ema20", "ema50", "atr_bands"],
+        "name": "1. Core Trend (EMA 20/50/200 + Volume)",
+        "indicators": ["ema20", "ema50", "ema200", "atr_bands"],
         "bucket": "Core 70%"
     },
     "watch_dip": {
         "name": "2. Watch -> Pullback/Rally -> Buy/Short",
-        "indicators": ["ema20", "ema50", "vwap", "gk_bands"],
+        "indicators": ["ema20", "ema50", "ema200", "vwap", "gk_bands"],
         "bucket": "Core 70%"
     },
     "smc_fvg": {
         "name": "3. SMC & Fair Value Gaps (Bull/Bear FVG)",
-        "indicators": ["fvg_zones", "ema50", "atr_bands"],
+        "indicators": ["fvg_zones", "ema50", "ema200", "atr_bands"],
         "bucket": "Satellite 30%"
     },
     "fib_golden": {
         "name": "4. Fibonacci Golden Pocket (0.618 / 0.382)",
-        "indicators": ["fib_levels", "ema50"],
+        "indicators": ["fib_levels", "ema50", "ema200"],
         "bucket": "Core 70%"
     },
     "orb": {
         "name": "5. Opening Range Breakout/Breakdown (ORB)",
-        "indicators": ["orb_levels", "vwap"],
+        "indicators": ["orb_levels", "vwap", "ema200"],
         "bucket": "Satellite 30%"
     },
     "do_t": {
         "name": "6. Intraday 'Do T' (VWAP +-2 Sigma L/S)",
-        "indicators": ["vwap", "vwap_bands", "gk_bands"],
+        "indicators": ["vwap", "vwap_bands", "gk_bands", "ema200"],
         "bucket": "Satellite 30%"
     },
     "composite": {
         "name": "7. Composite Score (Alpha*A + Beta*B + Gamma*C)",
-        "indicators": ["ema20", "vwap", "gk_bands"],
+        "indicators": ["ema20", "ema200", "vwap", "gk_bands"],
         "bucket": "Core 70%"
     },
     "scale_ladder": {
         "name": "8. Momentum Scale-Out Ladder (Sell xx% @ +xx% Tiers)",
-        "indicators": ["ema20", "vwap", "gk_bands", "atr_bands"],
+        "indicators": ["ema20", "ema200", "vwap", "gk_bands", "atr_bands"],
         "bucket": "Core 70%"
     },
     "plain_tpsl": {
-        "name": "9. Replay / Manual Sandbox (Inject trades via HUD)",
-        "indicators": ["atr_bands", "gk_bands"],
+        "name": "9. Plain TP/SL & Manual Replay Sandbox",
+        "indicators": ["ema20", "ema200", "atr_bands", "gk_bands"],
         "bucket": "Sandbox"
     }
 }
@@ -618,11 +663,10 @@ def run_strategy_backtest(
     tf: str,
     strategy_key: str,
     trade_side: str = "both",
+    ema200_filter: str = "none",
     sl_mult: float = 1.5,
     tp_mult: float = 3.0,
     vol_model: str = "atr",
-    ema200_filter: bool = False,
-    manual_trades: Optional[List[Dict]] = None,
     enable_scale_out: bool = True,
     t1_gain_pct: float = 4.0,
     t1_sell_pct: float = 35.0,
@@ -632,6 +676,9 @@ def run_strategy_backtest(
     core_pct: float = 0.70,
     intraday_pct: float = 0.30,
     risk_per_trade_pct: float = 0.01,
+    manual_entry_ts: Optional[int] = None,
+    manual_side: str = "long",
+    manual_alloc_pct: Optional[float] = None
 ) -> Dict[str, Any]:
     n = len(df)
     if n == 0:
@@ -670,9 +717,6 @@ def run_strategy_backtest(
     comp_score = df['composite_score'].values
     rsi = df['rsi'].values
 
-    # Mapping for injected Sandbox Replay manual trades
-    manual_map = {int(t['ts']): t for t in manual_trades} if manual_trades else {}
-
     is_intraday_strat = strategy_key in ["orb", "do_t", "smc_fvg"]
     core_cash = initial_capital * core_pct
     intraday_cash = initial_capital * intraday_pct
@@ -698,10 +742,11 @@ def run_strategy_backtest(
     remaining_shares = 0
     reserved_cash = 0.0
     realized_trade_pnl = 0.0
-    scale_stage = 0  # 0 = untouched, 1 = T1 hit, 2 = T2 hit
+    scale_stage = 0
     t1_target_price = 0.0
     t2_target_price = 0.0
     scale_notes: List[str] = []
+
     entry_signal_reason = ""
     dollar_risk_at_entry = 0.0
 
@@ -728,9 +773,15 @@ def run_strategy_backtest(
             open_val = reserved_cash + (entry_price - mark_price) * remaining_shares
         return core_cash + intraday_cash + open_val
 
-    def _calc_shares(ep: float, slp: float) -> tuple[int, float]:
+    def _calc_shares(ep: float, slp: float, force_alloc_pct: Optional[float] = None) -> tuple[int, float]:
         tot_eq = max(_total_portfolio_equity(ep), 1000.0)
         avail_pool_cash = max(_get_active_pool_cash(), 0.0)
+        if force_alloc_pct is not None and force_alloc_pct > 0:
+            target_dollars = tot_eq * (min(force_alloc_pct, 100.0) / 100.0)
+            shares_int = max(1, int(math.floor(target_dollars / max(ep, 0.01))))
+            actual_risk = shares_int * abs(ep - slp)
+            return shares_int, actual_risk
+
         if avail_pool_cash < ep:
             return 0, 0.0
         risk_budget = tot_eq * risk_per_trade_pct
@@ -752,13 +803,14 @@ def run_strategy_backtest(
         d2 = min(pct_dist_2, full_dist * 0.78) if tf in ["1h", "15m", "5m", "1m"] else min(pct_dist_2, full_dist * 0.82)
         d1 = max(d1, ep * 0.002)
         d2 = max(d2, d1 * 1.35)
-        if is_long: return ep + d1, ep + d2
-        else: return ep - d1, ep - d2
+        if is_long:
+            return ep + d1, ep + d2
+        else:
+            return ep - d1, ep - d2
 
     for i in range(1, n):
         ts = timestamps[i]
         c_high, c_low, c_close, c_open = highs[i], lows[i], closes[i], opens[i]
-
         unit_vol = gks[i] if vol_model == "gk" else atrs[i]
         if np.isnan(unit_vol) or math.isinf(unit_vol) or unit_vol <= 0:
             unit_vol = max(c_close * 0.015, 0.01)
@@ -769,12 +821,12 @@ def run_strategy_backtest(
         trend_long, trend_short = False, False
         trig_long, trig_short = False, False
 
-        # Compute Core Strategies
         if strategy_key == "trend":
             trend_long = c_close > ema50[i] and ema20[i] > ema50[i]
             trig_long = trend_long and (c_low <= ema20[i] * 1.008) and (c_close > c_open) and (rvol[i] >= 0.9)
             trend_short = c_close < ema50[i] and ema20[i] < ema50[i]
             trig_short = trend_short and (c_high >= ema20[i] * 0.992) and (c_close < c_open) and (rvol[i] >= 0.9)
+
         elif strategy_key == "watch_dip":
             trend_long = ema20[i] > ema50[i]
             trend_short = ema20[i] < ema50[i]
@@ -784,100 +836,87 @@ def run_strategy_backtest(
             if state in [-1, -3]:
                 watch_trough = min(watch_trough, c_low) if watch_trough > 0 else c_low
                 trig_short = ((c_high - watch_trough) >= 0.8 * unit_vol) and (c_close < c_open)
+
         elif strategy_key == "smc_fvg":
             trend_long = c_close >= ema50[i] * 0.98
             trig_long = bool(smc_bull[i])
             trend_short = c_close <= ema50[i] * 1.02
             trig_short = bool(smc_bear[i])
+
         elif strategy_key == "fib_golden":
             trend_long = c_close > fib_786[i] and ema20[i] >= ema50[i] * 0.99
             trig_long = trend_long and (c_low <= fib_618[i] * 1.005) and (c_close >= fib_618[i]) and (rsi[i] < 60)
             trend_short = c_close < swing_high[i] and ema20[i] < ema50[i] * 1.01
             trig_short = trend_short and (c_high >= fib_382[i] * 0.995) and (c_close <= fib_382[i]) and (rsi[i] > 40)
+
         elif strategy_key == "orb":
             if not np.isnan(orb_high[i]) and not np.isnan(orb_low[i]):
                 trend_long = c_close > orb_mid[i] and c_close > vwap[i]
                 trig_long = (closes[i - 1] <= orb_high[i - 1]) and (c_close > orb_high[i]) and (rvol[i] >= 1.2)
                 trend_short = c_close < orb_mid[i] and c_close < vwap[i]
                 trig_short = (closes[i - 1] >= orb_low[i - 1]) and (c_close < orb_low[i]) and (rvol[i] >= 1.2)
+
         elif strategy_key == "do_t":
             trend_long = c_close > ema50[i] * 0.93
             trig_long = (c_low <= vwap_l2[i]) and (c_close > c_open)
             trend_short = c_close < ema50[i] * 1.07
             trig_short = (c_high >= vwap_u2[i]) and (c_close < c_open)
+
         elif strategy_key == "composite":
             trend_long = comp_score[i] > 0.15
             trig_long = comp_score[i] >= 0.48
             trend_short = comp_score[i] < -0.15
             trig_short = comp_score[i] <= -0.48
+
         elif strategy_key == "scale_ladder":
             trend_long = (c_close > ema20[i]) and (ema20[i] >= ema50[i] * 0.995)
             trig_long = trend_long and (c_close > vwap[i]) and (rvol[i] >= 1.05) and (c_close > c_open)
             trend_short = (c_close < ema20[i]) and (ema20[i] <= ema50[i] * 1.005)
             trig_short = trend_short and (c_close < vwap[i]) and (rvol[i] >= 1.05) and (c_close < c_open)
+
         elif strategy_key == "plain_tpsl":
-            pass # Handled below via manual overrides
+            if manual_entry_ts is not None:
+                is_hit_bar = (ts >= manual_entry_ts) and (timestamps[i - 1] < manual_entry_ts or i == 1)
+                if manual_side == "short":
+                    trend_short = True
+                    trig_short = is_hit_bar
+                else:
+                    trend_long = True
+                    trig_long = is_hit_bar
+            else:
+                trend_long = c_close > ema20[i]
+                trig_long = (c_close > highs[i - 1]) and (c_close > c_open)
+                trend_short = c_close < ema20[i]
+                trig_short = (c_close < lows[i - 1]) and (c_close < c_open)
 
         # ----------------------------------------------------------------------
-        # EMA 200 TREND FILTER
+        # CONFIGURABLE EMA 200 FILTER (APPLIED TO ALL STRATEGIES)
+        # 1. "trend_follow": Ignore Long below EMA200 & Ignore Short above EMA200
+        # 2. "counter_trend": Only Short above EMA200 (upward trend) & Only Long below EMA200 (downward trend)
         # ----------------------------------------------------------------------
-        if ema200_filter:
-            if c_close < ema200[i]: 
-                trig_long, trend_long = False, False
-            if c_close > ema200[i]:
-                trig_short, trend_short = False, False
+        if manual_entry_ts is None:
+            if ema200_filter == "trend_follow":
+                if c_close < ema200[i]:
+                    trend_long, trig_long = False, False
+                if c_close > ema200[i]:
+                    trend_short, trig_short = False, False
+            elif ema200_filter == "counter_trend":
+                if c_close >= ema200[i]:
+                    trend_long, trig_long = False, False
+                if c_close <= ema200[i]:
+                    trend_short, trig_short = False, False
 
-        if not allow_long: trend_long, trig_long = False, False
-        if not allow_short: trend_short, trig_short = False, False
+        if not allow_long:
+            trend_long, trig_long = False, False
+        if not allow_short:
+            trend_short, trig_short = False, False
 
         # ----------------------------------------------------------------------
-        # MANUAL REPLAY INJECTION & STATE TRANSITIONS
+        # STATE MACHINE TRANSITIONS
         # ----------------------------------------------------------------------
-        req = manual_map.get(ts)
-        
-        if strategy_key == "plain_tpsl" and req:
-            # Handle Manual CLOSE Override
-            if req['side'] == 'close' and state in [2, -2]:
-                exit_price = c_close
-                rem_pnl = (exit_price - entry_price) * remaining_shares if state == 2 else (entry_price - exit_price) * remaining_shares
-                _set_active_pool_cash(_get_active_pool_cash() + (remaining_shares * entry_price) + rem_pnl)
-                total_pnl = realized_trade_pnl + rem_pnl
-                pos_val = entry_price * initial_shares
-                cur_eq = _total_portfolio_equity(c_close)
-                alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
-                scale_notes.append("MANUAL CLOSE")
-                ladder_str = " -> ".join(scale_notes)
-                trades.append({
-                    "trade_no": len(trades) + 1, "side": "LONG" if state == 2 else "SHORT",
-                    "signal_type": "MANUAL HUD", "pool": "Sandbox",
-                    "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(i),
-                    "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-                    "exit_time": ts, "exit_dt": _fmt_dt(dt_index[i], tf),
-                    "type": "CLOSE", "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2),
-                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
-                    "scale_summary": ladder_str, "shares": int(initial_shares),
-                    "position_value": _clean_float(pos_val, 0.0, 2), "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
-                    "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2), "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
-                    "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2), "pnl": _clean_float(total_pnl, 0.0, 2),
-                    "ret_pct": _clean_float((total_pnl / max(pos_val, 1e-6)) * 100.0, 0.0, 2),
-                    "equity_after": _clean_float(cur_eq, initial_capital, 2)
-                })
-                boxes.append({
-                    "trade_no": len(trades), "side": "LONG" if state == 2 else "SHORT",
-                    "t1": timestamps[entry_idx], "t2": ts, "entry": _clean_float(entry_price),
-                    "tp": _clean_float(tp_price), "sl": _clean_float(initial_sl_price),
-                    "t1_lvl": _clean_float(t1_target_price), "t2_lvl": _clean_float(t2_target_price),
-                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price), "outcome": "CLOSE"
-                })
-                markers.append({"time": ts, "position": "aboveBar" if state == 2 else "belowBar", "color": "#FF9800", "shape": "circle", "text": "MANUAL CLOSE"})
-                state = 0
-                remaining_shares = 0
-                reserved_cash = 0.0
-            
-            # Handle Manual BUY/SHORT Override
-            elif state == 0 and req['side'] in ['long', 'short']:
-                is_long = (req['side'] == 'long')
+        if state == 0:
+            if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
+                is_long = trig_long
                 entry_price = c_close
                 entry_idx = i
                 entry_sl_mult_used = cur_sl_mult
@@ -895,32 +934,28 @@ def run_strategy_backtest(
                     alt_sl_price = entry_price + cur_sl_mult * safe_gk
                     alt_tp_price = entry_price - cur_tp_mult * safe_gk
 
-                # Manual Replay Trade Sizing uses the requested % of portfolio
-                pct_req = float(req.get('pct', 10.0)) / 100.0
-                alloc_dollars = _total_portfolio_equity(c_close) * pct_req
-                avail_pool_cash = max(_get_active_pool_cash(), 0.0)
-                sh = max(1, int(min(alloc_dollars, avail_pool_cash * 0.98) / c_close))
-                
+                sh, d_risk = _calc_shares(entry_price, sl_price, force_alloc_pct=manual_alloc_pct)
                 if sh > 0:
                     state = 2 if is_long else -2
                     initial_shares = sh
                     remaining_shares = sh
                     initial_sl_price = sl_price
-                    dollar_risk_at_entry = sh * abs(entry_price - sl_price)
+                    dollar_risk_at_entry = d_risk
                     reserved_cash = sh * entry_price
                     _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
                     realized_trade_pnl = 0.0
                     scale_stage = 0
                     scale_notes = []
                     t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, is_long)
-                    entry_signal_reason = f"MANUAL HUD ({cur_sl_mult}x/{cur_tp_mult}x)"
+                    entry_signal_reason = f"MANUAL ({cur_sl_mult}x/{cur_tp_mult}x)"
                     markers.append({
-                        "time": ts, "position": "belowBar" if is_long else "aboveBar", "color": "#00E676" if is_long else "#FF4081",
-                        "shape": "arrowUp" if is_long else "arrowDown", "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({sh}sh)"
+                        "time": ts,
+                        "position": "belowBar" if is_long else "aboveBar",
+                        "color": "#00E676" if is_long else "#FF4081",
+                        "shape": "arrowUp" if is_long else "arrowDown",
+                        "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({sh} sh @ ${entry_price:.2f})"
                     })
-
-        elif state == 0:
-            if trend_long:
+            elif trend_long:
                 state = 1
                 watch_peak = c_high
                 markers.append({"time": ts, "position": "belowBar", "color": "#90A4AE", "shape": "circle", "text": "WATCH L"})
@@ -930,7 +965,7 @@ def run_strategy_backtest(
                 markers.append({"time": ts, "position": "aboveBar", "color": "#B0BEC5", "shape": "circle", "text": "WATCH S"})
 
         elif state in [1, 3]:
-            if not trend_long:
+            if not trend_long and manual_entry_ts is None:
                 state = -1 if trend_short else 0
                 watch_trough = c_low
             elif trig_long:
@@ -949,6 +984,7 @@ def run_strategy_backtest(
                 else:
                     sl_price = entry_price - cur_sl_mult * unit_vol
                     tp_price = entry_price + cur_tp_mult * unit_vol
+
                 alt_sl_price = entry_price - cur_sl_mult * safe_gk
                 alt_tp_price = entry_price + cur_tp_mult * safe_gk
 
@@ -967,12 +1003,15 @@ def run_strategy_backtest(
                     t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, True)
                     entry_signal_reason = f"{'RE-LONG' if is_re else 'LONG'} ({cur_sl_mult}x/{cur_tp_mult}x)"
                     markers.append({
-                        "time": ts, "position": "belowBar", "color": "#00B0FF" if is_re else "#00E676",
-                        "shape": "arrowUp", "text": f"{'RE-BUY' if is_re else 'BUY'} {sh} sh"
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#00B0FF" if is_re else "#00E676",
+                        "shape": "arrowUp",
+                        "text": f"{'RE-BUY' if is_re else 'BUY'} {sh} sh @ ${entry_price:.2f}"
                     })
 
         elif state in [-1, -3]:
-            if not trend_short:
+            if not trend_short and manual_entry_ts is None:
                 state = 1 if trend_long else 0
                 watch_peak = c_high
             elif trig_short:
@@ -991,6 +1030,7 @@ def run_strategy_backtest(
                 else:
                     sl_price = entry_price + cur_sl_mult * unit_vol
                     tp_price = entry_price - cur_tp_mult * unit_vol
+
                 alt_sl_price = entry_price + cur_sl_mult * safe_gk
                 alt_tp_price = entry_price - cur_tp_mult * safe_gk
 
@@ -1009,12 +1049,15 @@ def run_strategy_backtest(
                     t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, False)
                     entry_signal_reason = f"{'RE-SHORT' if is_re else 'SHORT'} ({cur_sl_mult}x/{cur_tp_mult}x)"
                     markers.append({
-                        "time": ts, "position": "aboveBar", "color": "#E040FB" if is_re else "#FF4081",
-                        "shape": "arrowDown", "text": f"{'RE-SHORT' if is_re else 'SHORT'} {sh} sh"
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#E040FB" if is_re else "#FF4081",
+                        "shape": "arrowDown",
+                        "text": f"{'RE-SHORT' if is_re else 'SHORT'} {sh} sh @ ${entry_price:.2f}"
                     })
 
         # ----------------------------------------------------------------------
-        # ACTIVE LONG POSITION MANAGEMENT (WITH MULTI-TRANCHE SCALE-OUT LADDER)
+        # ACTIVE LONG POSITION MANAGEMENT
         # ----------------------------------------------------------------------
         elif state == 2:
             do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
@@ -1032,8 +1075,14 @@ def run_strategy_backtest(
                         reserved_cash = remaining_shares * entry_price
                         scale_stage = 1
                         sl_price = max(sl_price, entry_price)
-                        scale_notes.append(f"T1(-{qty1}sh)")
-                        markers.append({"time": ts, "position": "aboveBar", "color": "#80D8FF", "shape": "circle", "text": f"T1 SELL"})
+                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "aboveBar",
+                            "color": "#80D8FF",
+                            "shape": "circle",
+                            "text": f"T1 SELL {qty1}sh (+${part_pnl:,.0f})"
+                        })
 
                 if scale_stage == 1 and c_high >= t2_target_price and t2_target_price < tp_price and remaining_shares >= 2:
                     qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
@@ -1046,11 +1095,18 @@ def run_strategy_backtest(
                         reserved_cash = remaining_shares * entry_price
                         scale_stage = 2
                         sl_price = max(sl_price, t1_target_price)
-                        scale_notes.append(f"T2(-{qty2}sh)")
-                        markers.append({"time": ts, "position": "aboveBar", "color": "#40C4FF", "shape": "circle", "text": f"T2 SELL"})
+                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "aboveBar",
+                            "color": "#40C4FF",
+                            "shape": "circle",
+                            "text": f"T2 SELL {qty2}sh (+${part_pnl:,.0f})"
+                        })
 
             hit_tp = c_high >= tp_price
             hit_sl = c_low <= sl_price
+
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 rem_pnl = (exit_price - entry_price) * remaining_shares
@@ -1061,7 +1117,6 @@ def run_strategy_backtest(
 
                 remaining_shares = 0
                 reserved_cash = 0.0
-                state_before = scale_stage
                 state = 0
                 cur_eq = _total_portfolio_equity(c_close)
                 alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
@@ -1070,36 +1125,71 @@ def run_strategy_backtest(
                 ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
 
                 trades.append({
-                    "trade_no": len(trades) + 1, "side": "LONG", "signal_type": entry_signal_reason, "pool": pool_label,
-                    "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(i),
-                    "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-                    "exit_time": ts, "exit_dt": _fmt_dt(dt_index[i], tf), "type": res_type,
-                    "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2),
-                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x", "scale_summary": ladder_str,
-                    "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(total_pnl, 0.0, 2), "ret_pct": _clean_float(ret_pct, 0.0, 2),
+                    "trade_no": len(trades) + 1,
+                    "side": "LONG",
+                    "signal_type": entry_signal_reason,
+                    "pool": pool_label,
+                    "entry_bar_idx": int(entry_idx),
+                    "exit_bar_idx": int(i),
+                    "entry_time": timestamps[entry_idx],
+                    "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
+                    "exit_time": ts,
+                    "exit_dt": _fmt_dt(dt_index[i], tf),
+                    "type": res_type,
+                    "entry_price": _clean_float(entry_price, 0.0, 2),
+                    "exit_price": _clean_float(exit_price, 0.0, 2),
+                    "sl_price": _clean_float(initial_sl_price, 0.0, 2),
+                    "tp_price": _clean_float(tp_price, 0.0, 2),
+                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+                    "scale_summary": ladder_str,
+                    "shares": int(initial_shares),
+                    "position_value": _clean_float(pos_val, 0.0, 2),
+                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+                    "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+                    "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+                    "pnl": _clean_float(total_pnl, 0.0, 2),
+                    "ret_pct": _clean_float(ret_pct, 0.0, 2),
                     "equity_after": _clean_float(cur_eq, initial_capital, 2)
                 })
                 boxes.append({
-                    "trade_no": len(trades), "side": "LONG", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(initial_sl_price),
-                    "t1_lvl": _clean_float(t1_target_price), "t2_lvl": _clean_float(t2_target_price),
-                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price), "outcome": res_type
+                    "trade_no": len(trades),
+                    "side": "LONG",
+                    "t1": timestamps[entry_idx],
+                    "t2": ts,
+                    "entry": _clean_float(entry_price),
+                    "tp": _clean_float(tp_price),
+                    "sl": _clean_float(initial_sl_price),
+                    "t1_lvl": _clean_float(t1_target_price),
+                    "t2_lvl": _clean_float(t2_target_price),
+                    "alt_tp": _clean_float(alt_tp_price),
+                    "alt_sl": _clean_float(alt_sl_price),
+                    "outcome": res_type
                 })
+
                 if hit_tp or total_pnl > 0:
-                    markers.append({"time": ts, "position": "aboveBar", "color": "#FFD600", "shape": "arrowDown", "text": f"L-{res_type}"})
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#FFD600",
+                        "shape": "arrowDown",
+                        "text": f"L-{res_type} (+${total_pnl:,.0f})"
+                    })
                     state = 1 if trend_long else (-1 if trend_short else 0)
                     watch_peak = c_high
                 else:
-                    markers.append({"time": ts, "position": "aboveBar", "color": "#FF1744", "shape": "arrowDown", "text": f"L-SL"})
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#FF1744",
+                        "shape": "arrowDown",
+                        "text": f"L-SL (-${abs(total_pnl):,.0f})"
+                    })
                     state = 3 if trend_long else (-1 if trend_short else 0)
                     watch_peak = c_high
 
         # ----------------------------------------------------------------------
-        # ACTIVE SHORT POSITION MANAGEMENT (WITH MULTI-TRANCHE SCALE-OUT LADDER)
+        # ACTIVE SHORT POSITION MANAGEMENT
         # ----------------------------------------------------------------------
         elif state == -2:
             do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
@@ -1117,8 +1207,14 @@ def run_strategy_backtest(
                         reserved_cash = remaining_shares * entry_price
                         scale_stage = 1
                         sl_price = min(sl_price, entry_price)
-                        scale_notes.append(f"T1(-{qty1}sh)")
-                        markers.append({"time": ts, "position": "belowBar", "color": "#80D8FF", "shape": "circle", "text": f"T1 COVER"})
+                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "belowBar",
+                            "color": "#80D8FF",
+                            "shape": "circle",
+                            "text": f"T1 COVER {qty1}sh (+${part_pnl:,.0f})"
+                        })
 
                 if scale_stage == 1 and c_low <= t2_target_price and t2_target_price > tp_price and remaining_shares >= 2:
                     qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
@@ -1131,11 +1227,18 @@ def run_strategy_backtest(
                         reserved_cash = remaining_shares * entry_price
                         scale_stage = 2
                         sl_price = min(sl_price, t1_target_price)
-                        scale_notes.append(f"T2(-{qty2}sh)")
-                        markers.append({"time": ts, "position": "belowBar", "color": "#40C4FF", "shape": "circle", "text": f"T2 COVER"})
+                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "belowBar",
+                            "color": "#40C4FF",
+                            "shape": "circle",
+                            "text": f"T2 COVER {qty2}sh (+${part_pnl:,.0f})"
+                        })
 
             hit_tp = c_low <= tp_price
             hit_sl = c_high >= sl_price
+
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 rem_pnl = (entry_price - exit_price) * remaining_shares
@@ -1154,31 +1257,66 @@ def run_strategy_backtest(
                 ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
 
                 trades.append({
-                    "trade_no": len(trades) + 1, "side": "SHORT", "signal_type": entry_signal_reason, "pool": pool_label,
-                    "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(i),
-                    "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-                    "exit_time": ts, "exit_dt": _fmt_dt(dt_index[i], tf), "type": res_type,
-                    "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2),
-                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x", "scale_summary": ladder_str,
-                    "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(total_pnl, 0.0, 2), "ret_pct": _clean_float(ret_pct, 0.0, 2),
+                    "trade_no": len(trades) + 1,
+                    "side": "SHORT",
+                    "signal_type": entry_signal_reason,
+                    "pool": pool_label,
+                    "entry_bar_idx": int(entry_idx),
+                    "exit_bar_idx": int(i),
+                    "entry_time": timestamps[entry_idx],
+                    "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
+                    "exit_time": ts,
+                    "exit_dt": _fmt_dt(dt_index[i], tf),
+                    "type": res_type,
+                    "entry_price": _clean_float(entry_price, 0.0, 2),
+                    "exit_price": _clean_float(exit_price, 0.0, 2),
+                    "sl_price": _clean_float(initial_sl_price, 0.0, 2),
+                    "tp_price": _clean_float(tp_price, 0.0, 2),
+                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+                    "scale_summary": ladder_str,
+                    "shares": int(initial_shares),
+                    "position_value": _clean_float(pos_val, 0.0, 2),
+                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+                    "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+                    "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+                    "pnl": _clean_float(total_pnl, 0.0, 2),
+                    "ret_pct": _clean_float(ret_pct, 0.0, 2),
                     "equity_after": _clean_float(cur_eq, initial_capital, 2)
                 })
                 boxes.append({
-                    "trade_no": len(trades), "side": "SHORT", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(initial_sl_price),
-                    "t1_lvl": _clean_float(t1_target_price), "t2_lvl": _clean_float(t2_target_price),
-                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price), "outcome": res_type
+                    "trade_no": len(trades),
+                    "side": "SHORT",
+                    "t1": timestamps[entry_idx],
+                    "t2": ts,
+                    "entry": _clean_float(entry_price),
+                    "tp": _clean_float(tp_price),
+                    "sl": _clean_float(initial_sl_price),
+                    "t1_lvl": _clean_float(t1_target_price),
+                    "t2_lvl": _clean_float(t2_target_price),
+                    "alt_tp": _clean_float(alt_tp_price),
+                    "alt_sl": _clean_float(alt_sl_price),
+                    "outcome": res_type
                 })
+
                 if hit_tp or total_pnl > 0:
-                    markers.append({"time": ts, "position": "belowBar", "color": "#FFD600", "shape": "arrowUp", "text": f"S-{res_type}"})
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#FFD600",
+                        "shape": "arrowUp",
+                        "text": f"S-{res_type} (+${total_pnl:,.0f})"
+                    })
                     state = -1 if trend_short else (1 if trend_long else 0)
                     watch_trough = c_low
                 else:
-                    markers.append({"time": ts, "position": "belowBar", "color": "#FF1744", "shape": "arrowUp", "text": f"S-SL"})
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#FF1744",
+                        "shape": "arrowUp",
+                        "text": f"S-SL (-${abs(total_pnl):,.0f})"
+                    })
                     state = -3 if trend_short else (1 if trend_long else 0)
                     watch_trough = c_low
 
@@ -1188,7 +1326,6 @@ def run_strategy_backtest(
         max_dd_pct = max(max_dd_pct, dd)
         equity_curve.append({"time": ts, "value": _clean_float(live_eq, initial_capital, 2)})
 
-    # If a trade is still open on the final bar
     if state in [2, -2] and n > 0 and remaining_shares > 0:
         is_long_open = (state == 2)
         last_c = closes[-1]
@@ -1201,39 +1338,61 @@ def run_strategy_backtest(
         ladder_str = (" -> ".join(scale_notes) + f" ({remaining_shares}sh open)") if scale_notes else f"OPEN ({remaining_shares}sh)"
 
         trades.append({
-            "trade_no": len(trades) + 1, "side": "LONG" if is_long_open else "SHORT", "signal_type": entry_signal_reason, "pool": pool_label,
-            "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(n - 1),
-            "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-            "exit_time": timestamps[-1], "exit_dt": "OPEN (Active)", "type": "OPEN",
-            "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(last_c, 0.0, 2),
-            "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2),
-            "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x", "scale_summary": ladder_str,
-            "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-            "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-            "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-            "pnl": _clean_float(total_open_pnl, 0.0, 2), "ret_pct": _clean_float(unreal_pct, 0.0, 2),
+            "trade_no": len(trades) + 1,
+            "side": "LONG" if is_long_open else "SHORT",
+            "signal_type": entry_signal_reason,
+            "pool": pool_label,
+            "entry_bar_idx": int(entry_idx),
+            "exit_bar_idx": int(n - 1),
+            "entry_time": timestamps[entry_idx],
+            "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
+            "exit_time": timestamps[-1],
+            "exit_dt": "OPEN (Active)",
+            "type": "OPEN",
+            "entry_price": _clean_float(entry_price, 0.0, 2),
+            "exit_price": _clean_float(last_c, 0.0, 2),
+            "sl_price": _clean_float(initial_sl_price, 0.0, 2),
+            "tp_price": _clean_float(tp_price, 0.0, 2),
+            "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+            "scale_summary": ladder_str,
+            "shares": int(initial_shares),
+            "position_value": _clean_float(pos_val, 0.0, 2),
+            "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
+            "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
+            "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
+            "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
+            "pnl": _clean_float(total_open_pnl, 0.0, 2),
+            "ret_pct": _clean_float(unreal_pct, 0.0, 2),
             "equity_after": _clean_float(final_eq, initial_capital, 2)
         })
         boxes.append({
-            "trade_no": len(trades), "side": "LONG" if is_long_open else "SHORT",
-            "t1": timestamps[entry_idx], "t2": timestamps[-1],
-            "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(initial_sl_price),
-            "t1_lvl": _clean_float(t1_target_price), "t2_lvl": _clean_float(t2_target_price),
-            "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price), "outcome": "ACTIVE"
+            "trade_no": len(trades),
+            "side": "LONG" if is_long_open else "SHORT",
+            "t1": timestamps[entry_idx],
+            "t2": timestamps[-1],
+            "entry": _clean_float(entry_price),
+            "tp": _clean_float(tp_price),
+            "sl": _clean_float(initial_sl_price),
+            "t1_lvl": _clean_float(t1_target_price),
+            "t2_lvl": _clean_float(t2_target_price),
+            "alt_tp": _clean_float(alt_tp_price),
+            "alt_sl": _clean_float(alt_sl_price),
+            "outcome": "ACTIVE"
         })
 
     final_mark_equity = _total_portfolio_equity(closes[-1]) if n > 0 else initial_capital
-    closed_trades = [t for t in trades if t["type"] in ["TP", "TRAIL-WIN", "SL", "CLOSE"]]
+    closed_trades = [t for t in trades if t["type"] in ["TP", "TRAIL-WIN", "SL"]]
     total_trades = len(closed_trades)
     long_trades = sum(1 for t in closed_trades if t.get("side") == "LONG")
     short_trades = sum(1 for t in closed_trades if t.get("side") == "SHORT")
     wins = [t for t in closed_trades if t['pnl'] > 0]
     losses = [t for t in closed_trades if t['pnl'] <= 0]
-    win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
 
+    win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
     gross_profit = sum(t['pnl'] for t in wins)
     gross_loss = abs(sum(t['pnl'] for t in losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
+
     net_return_pct = ((final_mark_equity - initial_capital) / max(initial_capital, 1.0)) * 100.0
     buy_hold_ret = ((closes[-1] - closes[0]) / max(closes[0], 1e-6)) * 100.0 if n > 1 else 0.0
 
@@ -1266,10 +1425,16 @@ def run_strategy_backtest(
 
 
 # ==============================================================================
-# 4. BLACK-SCHOLES GREEKS & 60-DAY YAHOO LIVE OPTION CHAIN
+# 4. BLACK-SCHOLES GREEKS & YAHOO LIVE OPTION CHAIN (UP TO 60 DAYS) + HISTORY
 # ==============================================================================
 def black_scholes_analysis(
-    S: float, K: float, days_to_expiry: int, iv_pct: float, r_pct: float, gk_daily_vol_pct: float, opt_type: str = "call"
+    S: float,
+    K: float,
+    days_to_expiry: int,
+    iv_pct: float,
+    r_pct: float,
+    gk_daily_vol_pct: float,
+    opt_type: str = "call"
 ) -> Dict[str, Any]:
     S = max(_clean_float(S, 100.0), 0.01)
     K = max(_clean_float(K, 100.0), 0.01)
@@ -1297,133 +1462,198 @@ def black_scholes_analysis(
 
     gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
     vega = (S * norm.pdf(d1) * math.sqrt(T)) / 100.0
+
     expected_move_iv_dollar = S * sigma * math.sqrt(T)
     expected_move_hv_dollar = S * hv_annual * math.sqrt(T)
     iv_hv_ratio = sigma / max(hv_annual, 0.01)
 
-    if iv_hv_ratio > 1.25: verdict = "EXPENSIVE (IV Crush Warning: IV > Realized GK Vol)"
-    elif iv_hv_ratio < 0.85: verdict = "CHEAP / UNDERPRICED (Positive Vega Edge: IV < Realized GK Vol)"
-    else: verdict = "FAIRLY PRICED (IV aligned with Garman-Klass HV)"
+    if iv_hv_ratio > 1.25:
+        verdict = "EXPENSIVE (IV Crush Warning: IV > Realized GK Vol)"
+    elif iv_hv_ratio < 0.85:
+        verdict = "CHEAP / UNDERPRICED (Positive Vega Edge: IV < Realized GK Vol)"
+    else:
+        verdict = "FAIRLY PRICED (IV aligned with Garman-Klass HV)"
 
     return _sanitize_for_json({
-        "theo_price": _clean_float(price, 0.01, 3), "delta": _clean_float(delta, 0.0, 3), "gamma": _clean_float(gamma, 0.0, 4),
-        "theta_daily": _clean_float(theta, 0.0, 3), "vega_per_1pct": _clean_float(vega, 0.0, 3), "prob_itm_pct": _clean_float(prob_itm, 0.0, 1),
-        "breakeven": _clean_float(breakeven, S, 2), "hv_annual_pct": _clean_float(hv_annual * 100.0, 20.0, 1), "iv_hv_ratio": _clean_float(iv_hv_ratio, 1.0, 2),
-        "expected_move_iv": _clean_float(expected_move_iv_dollar, 1.0, 2), "expected_move_hv": _clean_float(expected_move_hv_dollar, 1.0, 2),
+        "theo_price": _clean_float(price, 0.01, 3),
+        "delta": _clean_float(delta, 0.0, 3),
+        "gamma": _clean_float(gamma, 0.0, 4),
+        "theta_daily": _clean_float(theta, 0.0, 3),
+        "vega_per_1pct": _clean_float(vega, 0.0, 3),
+        "prob_itm_pct": _clean_float(prob_itm, 0.0, 1),
+        "breakeven": _clean_float(breakeven, S, 2),
+        "hv_annual_pct": _clean_float(hv_annual * 100.0, 20.0, 1),
+        "iv_hv_ratio": _clean_float(iv_hv_ratio, 1.0, 2),
+        "expected_move_iv": _clean_float(expected_move_iv_dollar, 1.0, 2),
+        "expected_move_hv": _clean_float(expected_move_hv_dollar, 1.0, 2),
         "verdict": verdict
     })
 
 
 @app.get("/api/option_chain")
 def api_option_chain(
-    ticker: str = Query("SNDK"), expiry: Optional[str] = Query(None), spot: float = Query(100.0), gk_daily_vol_pct: float = Query(2.5)
+    ticker: str = Query("SNDK"),
+    expiry: Optional[str] = Query(None),
+    spot: float = Query(100.0),
+    gk_daily_vol_pct: float = Query(2.5),
+    max_dte: int = Query(60)
 ):
     ticker = ticker.upper().strip()
     spot = max(_clean_float(spot, 100.0), 1.0)
     gk_daily_vol_pct = max(_clean_float(gk_daily_vol_pct, 2.5), 0.2)
+    now_dt = datetime.now()
+    refresh_stamp = now_dt.strftime("%H:%M:%S")
 
     try:
         tk = yf.Ticker(ticker)
-        expirations = list(tk.options)
-        if expirations:
-            # 60 day filter
-            valid_exps = []
-            now_dt = datetime.now()
-            for exp in expirations:
-                exp_dt = datetime.strptime(exp, "%Y-%m-%d")
-                if (exp_dt - now_dt).days <= 65: # up to 60 days padding
-                    valid_exps.append(exp)
-            if not valid_exps:
-                valid_exps = expirations[:4]
-
-            sel_exp = expiry if (expiry in valid_exps) else valid_exps[0]
+        all_expirations = list(tk.options)
+        if all_expirations:
+            # Filter expirations up to 60 days out (with fallback if none in <=60d)
+            exp_up_to_60d = []
+            for exp_str in all_expirations:
+                try:
+                    dte_val = (datetime.strptime(exp_str, "%Y-%m-%d") - now_dt).days
+                    if 0 <= dte_val <= max_dte:
+                        exp_up_to_60d.append(exp_str)
+                except Exception:
+                    continue
+            expirations = exp_up_to_60d if exp_up_to_60d else all_expirations[:6]
+            sel_exp = expiry if (expiry in expirations) else expirations[0]
             chain = tk.option_chain(sel_exp)
-            dte = max(1, (datetime.strptime(sel_exp, "%Y-%m-%d") - datetime.now()).days)
+            dte = max(1, (datetime.strptime(sel_exp, "%Y-%m-%d") - now_dt).days)
 
             def format_side(df_side: pd.DataFrame, opt_type: str):
                 df_sub = df_side.copy()
                 df_sub["dist"] = (df_sub["strike"] - spot).abs()
-                df_sub = df_sub.sort_values("dist").head(12).sort_values("strike")
+                df_sub = df_sub.sort_values("dist").head(16).sort_values("strike")
                 rows = []
                 for _, r in df_sub.iterrows():
                     strike_v = _clean_float(r.get("strike"), spot, 2)
                     iv_val = _clean_float(r.get("impliedVolatility"), 0.5) * 100.0
                     bs = black_scholes_analysis(spot, strike_v, dte, max(iv_val, 5.0), 4.25, gk_daily_vol_pct, opt_type)
                     rows.append({
-                        "contractSymbol": str(r.get("contractSymbol", "")), "strike": strike_v,
-                        "lastPrice": _clean_float(r.get("lastPrice"), bs["theo_price"], 2), "bid": _clean_float(r.get("bid"), 0.0, 2), "ask": _clean_float(r.get("ask"), 0.0, 2),
-                        "iv_pct": _clean_float(iv_val, 50.0, 1), "volume": int(_clean_float(r.get("volume"), 0)), "openInterest": int(_clean_float(r.get("openInterest"), 0)),
-                        "delta": bs["delta"], "theta": bs["theta_daily"],
+                        "contractSymbol": str(r.get("contractSymbol", "")),
+                        "strike": strike_v,
+                        "dte": dte,
+                        "lastPrice": _clean_float(r.get("lastPrice"), bs["theo_price"], 2),
+                        "bid": _clean_float(r.get("bid"), 0.0, 2),
+                        "ask": _clean_float(r.get("ask"), 0.0, 2),
+                        "iv_pct": _clean_float(iv_val, 50.0, 1),
+                        "volume": int(_clean_float(r.get("volume"), 0)),
+                        "openInterest": int(_clean_float(r.get("openInterest"), 0)),
+                        "delta": bs["delta"],
+                        "theta": bs["theta_daily"],
                         "verdict": "CHEAP" if bs["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs["iv_hv_ratio"] > 1.25 else "FAIR")
                     })
                 return rows
 
             return _sanitize_for_json({
-                "source": "Yahoo Finance Live Option Chain (Up to 60 Days)",
-                "expirations": valid_exps, "selected_expiry": sel_exp,
-                "calls": format_side(chain.calls, "call"), "puts": format_side(chain.puts, "put")
+                "source": f"Yahoo Finance Live Option Chain (<= {max_dte}d | Updated {refresh_stamp})",
+                "updated_at": refresh_stamp,
+                "expirations": expirations,
+                "selected_expiry": sel_exp,
+                "dte": dte,
+                "calls": format_side(chain.calls, "call"),
+                "puts": format_side(chain.puts, "put")
             })
     except Exception:
         pass
 
     exp_dates = [
-        (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
-        (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
-        (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"),
-        (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d")
+        (now_dt + timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in [7, 14, 21, 30, 45, 60]
     ]
     sel_exp = expiry if (expiry in exp_dates) else exp_dates[1]
-    dte = max(1, (datetime.strptime(sel_exp, "%Y-%m-%d") - datetime.now()).days)
+    dte = max(1, (datetime.strptime(sel_exp, "%Y-%m-%d") - now_dt).days)
     hv_ann = max((gk_daily_vol_pct / 100.0) * math.sqrt(252) * 100.0, 25.0)
     step = max(1.0, round(spot * 0.025, 0))
     base_strike = round(spot / step) * step
 
     calls, puts = [], []
-    for k_idx in range(-5, 6):
+    for k_idx in range(-6, 7):
         k = round(base_strike + k_idx * step, 2)
-        if k <= 0: continue
+        if k <= 0:
+            continue
         skew_iv = hv_ann * (1.05 + 0.02 * abs(k_idx))
         bs_c = black_scholes_analysis(spot, k, dte, skew_iv, 4.25, gk_daily_vol_pct, "call")
         bs_p = black_scholes_analysis(spot, k, dte, skew_iv, 4.25, gk_daily_vol_pct, "put")
         ymd = sel_exp.replace("-", "")[2:]
         c_sym = f"{ticker}{ymd}C{int(k*1000):08d}"
         p_sym = f"{ticker}{ymd}P{int(k*1000):08d}"
+
         calls.append({
-            "contractSymbol": c_sym, "strike": k, "lastPrice": _clean_float(bs_c["theo_price"], 0.01, 2), "bid": _clean_float(max(0.01, bs_c["theo_price"] * 0.96), 0.01, 2),
-            "ask": _clean_float(bs_c["theo_price"] * 1.04, 0.02, 2), "iv_pct": _clean_float(skew_iv, 50.0, 1), "volume": 120 * (6 - abs(k_idx)), "openInterest": 850 * (6 - abs(k_idx)),
-            "delta": bs_c["delta"], "theta": bs_c["theta_daily"], "verdict": "CHEAP" if bs_c["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_c["iv_hv_ratio"] > 1.25 else "FAIR")
+            "contractSymbol": c_sym,
+            "strike": k,
+            "dte": dte,
+            "lastPrice": _clean_float(bs_c["theo_price"], 0.01, 2),
+            "bid": _clean_float(max(0.01, bs_c["theo_price"] * 0.96), 0.01, 2),
+            "ask": _clean_float(bs_c["theo_price"] * 1.04, 0.02, 2),
+            "iv_pct": _clean_float(skew_iv, 50.0, 1),
+            "volume": 120 * (7 - abs(k_idx)),
+            "openInterest": 850 * (7 - abs(k_idx)),
+            "delta": bs_c["delta"],
+            "theta": bs_c["theta_daily"],
+            "verdict": "CHEAP" if bs_c["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_c["iv_hv_ratio"] > 1.25 else "FAIR")
         })
         puts.append({
-            "contractSymbol": p_sym, "strike": k, "lastPrice": _clean_float(bs_p["theo_price"], 0.01, 2), "bid": _clean_float(max(0.01, bs_p["theo_price"] * 0.96), 0.01, 2),
-            "ask": _clean_float(bs_p["theo_price"] * 1.04, 0.02, 2), "iv_pct": _clean_float(skew_iv, 50.0, 1), "volume": 95 * (6 - abs(k_idx)), "openInterest": 720 * (6 - abs(k_idx)),
-            "delta": bs_p["delta"], "theta": bs_p["theta_daily"], "verdict": "CHEAP" if bs_p["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_p["iv_hv_ratio"] > 1.25 else "FAIR")
+            "contractSymbol": p_sym,
+            "strike": k,
+            "dte": dte,
+            "lastPrice": _clean_float(bs_p["theo_price"], 0.01, 2),
+            "bid": _clean_float(max(0.01, bs_p["theo_price"] * 0.96), 0.01, 2),
+            "ask": _clean_float(bs_p["theo_price"] * 1.04, 0.02, 2),
+            "iv_pct": _clean_float(skew_iv, 50.0, 1),
+            "volume": 95 * (7 - abs(k_idx)),
+            "openInterest": 720 * (7 - abs(k_idx)),
+            "delta": bs_p["delta"],
+            "theta": bs_p["theta_daily"],
+            "verdict": "CHEAP" if bs_p["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_p["iv_hv_ratio"] > 1.25 else "FAIR")
         })
 
     return _sanitize_for_json({
-        "source": "BSM + Garman-Klass Live Reconstructed Chain (Up to 60 Days)",
-        "expirations": exp_dates, "selected_expiry": sel_exp, "calls": calls, "puts": puts
+        "source": f"BSM + Garman-Klass Live Chain (<= 60d | Updated {refresh_stamp})",
+        "updated_at": refresh_stamp,
+        "expirations": exp_dates,
+        "selected_expiry": sel_exp,
+        "dte": dte,
+        "calls": calls,
+        "puts": puts
     })
 
 
 @app.get("/api/option_contract_history")
 def api_option_contract_history(
-    contract_symbol: str = Query(...), ticker: str = Query("SNDK"), strike: float = Query(100.0), opt_type: str = Query("call"), iv_pct: float = Query(55.0)
+    contract_symbol: str = Query(...),
+    ticker: str = Query("SNDK"),
+    strike: float = Query(100.0),
+    opt_type: str = Query("call"),
+    iv_pct: float = Query(55.0)
 ):
+    refresh_stamp = datetime.now().strftime("%H:%M:%S")
     try:
         opt_tk = yf.Ticker(contract_symbol)
-        df_opt = opt_tk.history(period="max", interval="1d")
+        df_opt = opt_tk.history(period="60d", interval="1d")
+        if df_opt.empty:
+            df_opt = opt_tk.history(period="max", interval="1d")
         if not df_opt.empty:
             df_opt.index = pd.to_datetime(df_opt.index).tz_localize(None)
             bars = [
                 {
-                    "date": dt.strftime("%Y-%m-%d"), "close": _clean_float(r["Close"], 0.01, 2),
-                    "high": _clean_float(r["High"], 0.01, 2), "low": _clean_float(r["Low"], 0.01, 2),
+                    "date": dt.strftime("%Y-%m-%d"),
+                    "close": _clean_float(r["Close"], 0.01, 2),
+                    "high": _clean_float(r["High"], 0.01, 2),
+                    "low": _clean_float(r["Low"], 0.01, 2),
                     "volume": int(_clean_float(r.get("Volume", 0), 0))
                 }
                 for dt, r in df_opt.tail(60).iterrows()
             ]
-            return _sanitize_for_json({"contract": contract_symbol, "source": "Yahoo Finance Contract History", "bars": bars})
-    except Exception: pass
+            return _sanitize_for_json({
+                "contract": contract_symbol,
+                "source": f"Yahoo Finance 60-Day Contract History (Updated {refresh_stamp})",
+                "bars": bars
+            })
+    except Exception:
+        pass
 
     df_stock, _ = fetch_and_construct_tf(ticker, "1d")
     df_sub = df_stock.tail(60)
@@ -1433,11 +1663,18 @@ def api_option_contract_history(
         rem_dte = max(7, total_days - idx + 14)
         bs = black_scholes_analysis(float(r["close"]), strike, rem_dte, iv_pct, 4.25, 2.5, opt_type)
         bars.append({
-            "date": dt.strftime("%Y-%m-%d"), "close": _clean_float(bs["theo_price"], 0.01, 2),
-            "high": _clean_float(bs["theo_price"] * 1.08, 0.01, 2), "low": _clean_float(max(0.01, bs["theo_price"] * 0.92), 0.01, 2),
+            "date": dt.strftime("%Y-%m-%d"),
+            "close": _clean_float(bs["theo_price"], 0.01, 2),
+            "high": _clean_float(bs["theo_price"] * 1.08, 0.01, 2),
+            "low": _clean_float(max(0.01, bs["theo_price"] * 0.92), 0.01, 2),
             "volume": int(max(10, _clean_float(r["volume"], 1000) / 5000))
         })
-    return _sanitize_for_json({"contract": contract_symbol, "source": "Historical Black-Scholes Reconstructed Curve", "bars": bars})
+
+    return _sanitize_for_json({
+        "contract": contract_symbol,
+        "source": f"60-Day Black-Scholes Reconstructed History (Updated {refresh_stamp})",
+        "bars": bars
+    })
 
 
 # ==============================================================================
@@ -1451,11 +1688,11 @@ def api_analyze(
     cutoff_ts: Optional[int] = Query(None),
     strategy: str = Query("trend"),
     trade_side: str = Query("both"),
+    ema200_filter: str = Query("none"),
     sl_mult: float = Query(1.5),
     tp_mult: float = Query(3.0),
     dynamic_tpsl: bool = Query(True),
     vol_model: str = Query("atr"),
-    ema200_filter: bool = Query(False),
     enable_scale_out: bool = Query(True),
     t1_gain_pct: float = Query(4.0),
     t1_sell_pct: float = Query(35.0),
@@ -1468,16 +1705,22 @@ def api_analyze(
     core_pct: float = Query(70.0),
     intraday_pct: float = Query(30.0),
     risk_pct: float = Query(1.0),
-    manual_trades_json: Optional[str] = Query(None)
+    manual_entry_ts: Optional[int] = Query(None),
+    manual_side: str = Query("long"),
+    manual_alloc_pct: Optional[float] = Query(None),
+    force_refresh: bool = Query(False)
 ):
-    df_raw, warn_msg = fetch_and_construct_tf(ticker, tf)
+    df_raw, warn_msg = fetch_and_construct_tf(ticker, tf, force_refresh=force_refresh)
     if df_raw.empty:
         return JSONResponse({"error": warn_msg or "No data available."}, status_code=400)
 
     first_avail_ts = int(df_raw.index[0].timestamp())
     if start_ts is not None and start_ts < first_avail_ts:
         first_dt_str = df_raw.index[0].strftime("%Y-%m-%d %H:%M")
-        extra_warn = f"Max Yahoo lookback limit: '{tf}' data unavailable prior to {first_dt_str}. Showing available bars."
+        extra_warn = (
+            f"Max Yahoo lookback limit: '{tf}' data is unavailable prior to {first_dt_str}. "
+            f"Showing all available '{tf}' bars starting from {first_dt_str}."
+        )
         warn_msg = f"{warn_msg} | {extra_warn}" if warn_msg else extra_warn
         start_ts = first_avail_ts
 
@@ -1490,7 +1733,7 @@ def api_analyze(
         mask_after = df_raw.index >= start_dt
         if mask_after.any():
             first_idx = int(np.argmax(mask_after))
-            warmup_start_idx = max(0, first_idx - 100)
+            warmup_start_idx = max(0, first_idx - 220)
             df_calc = df_raw.iloc[warmup_start_idx:].copy()
         else:
             df_calc = df_raw.copy()
@@ -1498,57 +1741,89 @@ def api_analyze(
         df_calc = df_raw.copy()
 
     df_ind, unavailable_list = compute_all_indicators(
-        df_calc, tf, atr_mult=sl_mult, gk_mult=tp_mult, dynamic_tpsl=dynamic_tpsl,
-        w_trend=w_trend, w_liq=w_liq, w_rev=w_rev
+        df_calc,
+        tf,
+        atr_mult=sl_mult,
+        gk_mult=tp_mult,
+        dynamic_tpsl=dynamic_tpsl,
+        w_trend=w_trend,
+        w_liq=w_liq,
+        w_rev=w_rev
     )
 
     if start_ts is not None:
         start_dt = datetime.fromtimestamp(start_ts)
         df_view = df_ind[df_ind.index >= start_dt].copy()
-        if df_view.empty: df_view = df_ind.copy()
+        if df_view.empty:
+            df_view = df_ind.copy()
     else:
         df_view = df_ind.copy()
 
-    manual_trades = []
-    if manual_trades_json:
-        try: manual_trades = json.loads(manual_trades_json)
-        except Exception: pass
-
     bt_selected = run_strategy_backtest(
-        df_view, tf=tf, strategy_key=strategy, trade_side=trade_side,
-        sl_mult=sl_mult, tp_mult=tp_mult, vol_model=vol_model,
-        ema200_filter=ema200_filter, manual_trades=manual_trades,
+        df_view,
+        tf=tf,
+        strategy_key=strategy,
+        trade_side=trade_side,
+        ema200_filter=ema200_filter,
+        sl_mult=sl_mult,
+        tp_mult=tp_mult,
+        vol_model=vol_model,
         enable_scale_out=enable_scale_out,
-        t1_gain_pct=t1_gain_pct, t1_sell_pct=t1_sell_pct,
-        t2_gain_pct=t2_gain_pct, t2_sell_pct=t2_sell_pct,
-        initial_capital=initial_capital, core_pct=core_pct / 100.0,
-        intraday_pct=intraday_pct / 100.0, risk_per_trade_pct=risk_pct / 100.0
+        t1_gain_pct=t1_gain_pct,
+        t1_sell_pct=t1_sell_pct,
+        t2_gain_pct=t2_gain_pct,
+        t2_sell_pct=t2_sell_pct,
+        initial_capital=initial_capital,
+        core_pct=core_pct / 100.0,
+        intraday_pct=intraday_pct / 100.0,
+        risk_per_trade_pct=risk_pct / 100.0,
+        manual_entry_ts=manual_entry_ts,
+        manual_side=manual_side,
+        manual_alloc_pct=manual_alloc_pct
     )
 
     all_summary = []
     for s_key in STRATEGY_METADATA.keys():
         res = run_strategy_backtest(
-            df_view, tf=tf, strategy_key=s_key, trade_side=trade_side,
-            sl_mult=sl_mult, tp_mult=tp_mult, vol_model=vol_model,
-            ema200_filter=ema200_filter, manual_trades=manual_trades if s_key == "plain_tpsl" else None,
+            df_view,
+            tf=tf,
+            strategy_key=s_key,
+            trade_side=trade_side,
+            ema200_filter=ema200_filter,
+            sl_mult=sl_mult,
+            tp_mult=tp_mult,
+            vol_model=vol_model,
             enable_scale_out=enable_scale_out,
-            t1_gain_pct=t1_gain_pct, t1_sell_pct=t1_sell_pct,
-            t2_gain_pct=t2_gain_pct, t2_sell_pct=t2_sell_pct,
-            initial_capital=initial_capital, core_pct=core_pct / 100.0,
-            intraday_pct=intraday_pct / 100.0, risk_per_trade_pct=risk_pct / 100.0
+            t1_gain_pct=t1_gain_pct,
+            t1_sell_pct=t1_sell_pct,
+            t2_gain_pct=t2_gain_pct,
+            t2_sell_pct=t2_sell_pct,
+            initial_capital=initial_capital,
+            core_pct=core_pct / 100.0,
+            intraday_pct=intraday_pct / 100.0,
+            risk_per_trade_pct=risk_pct / 100.0,
+            manual_entry_ts=manual_entry_ts if s_key == "plain_tpsl" else None,
+            manual_side=manual_side,
+            manual_alloc_pct=manual_alloc_pct if s_key == "plain_tpsl" else None
         )
         all_summary.append(res["stats"])
 
-    candles, volumes, bar_details = [], [], {}
+    candles = []
+    volumes = []
+    bar_details = {}
     series_data = {
-        "ema20": [], "ema50": [], "ema200": [], "vwap": [], "vwap_u2": [], "vwap_l2": [],
+        "ema20": [], "ema50": [], "ema200": [],
+        "vwap": [], "vwap_u2": [], "vwap_l2": [],
         "atr_upper": [], "atr_lower": [], "gk_upper": [], "gk_lower": [],
-        "fib_382": [], "fib_500": [], "fib_618": [], "fib_786": [], "orb_high": [], "orb_low": []
+        "fib_382": [], "fib_500": [], "fib_618": [], "fib_786": [],
+        "orb_high": [], "orb_low": []
     }
-    fvg_boxes, unclear_spans = [], []
-    in_unclear, unclear_start = False, None
-    idx_timestamps = [int(t.timestamp()) for t in df_view.index]
+    fvg_boxes = []
+    unclear_spans = []
+    in_unclear = False
+    unclear_start = None
 
+    idx_timestamps = [int(t.timestamp()) for t in df_view.index]
     is_intraday_strat = strategy in ["orb", "do_t", "smc_fvg"]
     pool_frac = (intraday_pct / 100.0) if is_intraday_strat else (core_pct / 100.0)
     risk_frac = risk_pct / 100.0
@@ -1566,7 +1841,8 @@ def api_analyze(
         d_tp = _clean_float(row['dyn_tp_mult'], tp_mult, 2)
 
         unit_v = gk_val if vol_model == "gk" else atr_val
-        if unit_v <= 0: unit_v = max(c_val * 0.015, 0.01)
+        if unit_v <= 0:
+            unit_v = max(c_val * 0.015, 0.01)
 
         stop_dist = max(d_sl * unit_v, c_val * 0.004, 0.01)
         risk_dollars = initial_capital * risk_frac
@@ -1577,21 +1853,45 @@ def api_analyze(
         sug_risk_dlr = _clean_float(sug_shares * stop_dist, 0.0, 2)
 
         candles.append({"time": ts, "open": o_val, "high": h_val, "low": l_val, "close": c_val})
-        volumes.append({"time": ts, "value": v_val, "color": "rgba(0, 230, 118, 0.35)" if c_val >= o_val else "rgba(255, 23, 68, 0.35)"})
-        chg_pct = ((c_val - o_val) / max(o_val, 1e-6)) * 100.0
+        volumes.append({
+            "time": ts,
+            "value": v_val,
+            "color": "rgba(0, 230, 118, 0.35)" if c_val >= o_val else "rgba(255, 23, 68, 0.35)"
+        })
 
+        chg_pct = ((c_val - o_val) / max(o_val, 1e-6)) * 100.0
+        ema200_v = _clean_float(row['ema200'], c_val, 2)
         bar_details[str(ts)] = {
-            "dt": _fmt_dt(dt, tf), "o": _clean_float(o_val, 0.0, 2), "h": _clean_float(h_val, 0.0, 2),
-            "l": _clean_float(l_val, 0.0, 2), "c": _clean_float(c_val, 0.0, 2), "chg_pct": _clean_float(chg_pct, 0.0, 2),
-            "vol": int(v_val), "rvol": _clean_float(row['rvol'], 1.0, 2),
-            "ema20": _clean_float(row['ema20'], c_val, 2), "ema50": _clean_float(row['ema50'], c_val, 2), "ema200": _clean_float(row['ema200'], c_val, 2),
-            "vwap": _clean_float(row['vwap'], c_val, 2), "rsi": _clean_float(row['rsi'], 50.0, 1),
-            "atr": _clean_float(atr_val, 0.0, 2), "gk_pct": _clean_float(float(row['gk_vol_pct']) * 100.0, 2.0, 2),
-            "score": _clean_float(row['composite_score'], 0.0, 2), "dyn_sl_mult": d_sl, "dyn_tp_mult": d_tp,
-            "regime": "UNCLEAR / VOLATILE" if bool(row['is_unclear_volatile']) else ("BULL TREND" if _clean_float(row['ema20']) >= _clean_float(row['ema50']) else "BEAR TREND"),
-            "sug_shares": sug_shares, "sug_pos_val": sug_pos_val, "sug_risk": sug_risk_dlr,
-            "long_sl": _clean_float(c_val - stop_dist, 0.0, 2), "long_tp": _clean_float(c_val + d_tp * unit_v, 0.0, 2),
-            "short_sl": _clean_float(c_val + stop_dist, 0.0, 2), "short_tp": _clean_float(c_val - d_tp * unit_v, 0.0, 2)
+            "dt": _fmt_dt(dt, tf),
+            "o": _clean_float(o_val, 0.0, 2),
+            "h": _clean_float(h_val, 0.0, 2),
+            "l": _clean_float(l_val, 0.0, 2),
+            "c": _clean_float(c_val, 0.0, 2),
+            "chg_pct": _clean_float(chg_pct, 0.0, 2),
+            "vol": int(v_val),
+            "rvol": _clean_float(row['rvol'], 1.0, 2),
+            "ema20": _clean_float(row['ema20'], c_val, 2),
+            "ema50": _clean_float(row['ema50'], c_val, 2),
+            "ema200": ema200_v,
+            "vwap": _clean_float(row['vwap'], c_val, 2),
+            "rsi": _clean_float(row['rsi'], 50.0, 1),
+            "atr": _clean_float(atr_val, 0.0, 2),
+            "gk_pct": _clean_float(float(row['gk_vol_pct']) * 100.0, 2.0, 2),
+            "score": _clean_float(row['composite_score'], 0.0, 2),
+            "dyn_sl_mult": d_sl,
+            "dyn_tp_mult": d_tp,
+            "unit_vol": _clean_float(unit_v, 0.01, 4),
+            "regime": "UNCLEAR / VOLATILE" if bool(row['is_unclear_volatile']) else (
+                "BULL TREND" if _clean_float(row['ema20']) >= _clean_float(row['ema50']) else "BEAR TREND"
+            ),
+            "vs_ema200": "ABOVE EMA200" if c_val >= ema200_v else "BELOW EMA200",
+            "sug_shares": sug_shares,
+            "sug_pos_val": sug_pos_val,
+            "sug_risk": sug_risk_dlr,
+            "long_sl": _clean_float(c_val - stop_dist, 0.0, 2),
+            "long_tp": _clean_float(c_val + d_tp * unit_v, 0.0, 2),
+            "short_sl": _clean_float(c_val + stop_dist, 0.0, 2),
+            "short_tp": _clean_float(c_val - d_tp * unit_v, 0.0, 2)
         }
 
         for col in series_data.keys():
@@ -1600,13 +1900,30 @@ def api_analyze(
                 series_data[col].append({"time": ts, "value": round(float(val), 4)})
 
         if bool(row['fvg_bull']) and i >= 2:
-            top_v, bot_v = row['fvg_bull_top'], row['fvg_bull_bot']
+            top_v = row['fvg_bull_top']
+            bot_v = row['fvg_bull_bot']
             if not pd.isna(top_v) and not pd.isna(bot_v):
-                fvg_boxes.append({"t1": idx_timestamps[i - 2], "t2": idx_timestamps[min(i + 8, len(idx_timestamps) - 1)], "top": _clean_float(top_v), "bot": _clean_float(bot_v), "kind": "BULL_FVG"})
+                t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
+                fvg_boxes.append({
+                    "t1": idx_timestamps[i - 2],
+                    "t2": t_end,
+                    "top": _clean_float(top_v),
+                    "bot": _clean_float(bot_v),
+                    "kind": "BULL_FVG"
+                })
+
         if bool(row['fvg_bear']) and i >= 2:
-            top_v, bot_v = row['fvg_bear_top'], row['fvg_bear_bot']
+            top_v = row['fvg_bear_top']
+            bot_v = row['fvg_bear_bot']
             if not pd.isna(top_v) and not pd.isna(bot_v):
-                fvg_boxes.append({"t1": idx_timestamps[i - 2], "t2": idx_timestamps[min(i + 8, len(idx_timestamps) - 1)], "top": _clean_float(top_v), "bot": _clean_float(bot_v), "kind": "BEAR_FVG"})
+                t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
+                fvg_boxes.append({
+                    "t1": idx_timestamps[i - 2],
+                    "t2": t_end,
+                    "top": _clean_float(top_v),
+                    "bot": _clean_float(bot_v),
+                    "kind": "BEAR_FVG"
+                })
 
         is_unc = bool(row['is_unclear_volatile'])
         if is_unc and not in_unclear:
@@ -1615,6 +1932,7 @@ def api_analyze(
         elif not is_unc and in_unclear:
             in_unclear = False
             unclear_spans.append({"t1": unclear_start, "t2": ts})
+
     if in_unclear and unclear_start is not None:
         unclear_spans.append({"t1": unclear_start, "t2": idx_timestamps[-1]})
 
@@ -1622,17 +1940,32 @@ def api_analyze(
     last_close = _clean_float(last_row['close'], 100.0, 2)
     last_atr = _clean_float(last_row['atr'], 1.5, 2)
     last_gk_pct = _clean_float(float(last_row['gk_vol_pct']) * 100.0, 2.5, 2)
+    last_ema200 = _clean_float(last_row['ema200'], last_close, 2)
 
     payload = {
-        "ticker": ticker.upper(), "tf": tf, "total_bars": len(candles),
-        "first_date": _fmt_dt(df_view.index[0], tf), "last_date": _fmt_dt(df_view.index[-1], tf),
-        "next_tf": NEXT_TIMEFRAME.get(tf, "1m"), "warning": warn_msg, "unavailable_indicators": unavailable_list,
+        "ticker": ticker.upper(),
+        "tf": tf,
+        "server_updated_at": datetime.now().strftime("%H:%M:%S"),
+        "total_bars": len(candles),
+        "first_date": _fmt_dt(df_view.index[0], tf),
+        "last_date": _fmt_dt(df_view.index[-1], tf),
+        "next_tf": NEXT_TIMEFRAME.get(tf, "1m"),
+        "warning": warn_msg,
+        "unavailable_indicators": unavailable_list,
         "auto_indicators": STRATEGY_METADATA[strategy]["indicators"],
-        "candles": candles, "volumes": volumes, "bar_details": bar_details, "series": series_data,
-        "fvg_boxes": fvg_boxes[-60:], "unclear_spans": unclear_spans,
-        "backtest": bt_selected, "all_strategies_summary": all_summary,
+        "candles": candles,
+        "volumes": volumes,
+        "bar_details": bar_details,
+        "series": series_data,
+        "fvg_boxes": fvg_boxes[-60:],
+        "unclear_spans": unclear_spans,
+        "backtest": bt_selected,
+        "all_strategies_summary": all_summary,
         "latest_metrics": {
-            "close": last_close, "atr": last_atr, "gk_daily_vol_pct": last_gk_pct,
+            "close": last_close,
+            "ema200": last_ema200,
+            "atr": last_atr,
+            "gk_daily_vol_pct": last_gk_pct,
             "composite_score": _clean_float(last_row['composite_score'], 0.0, 2),
             "dyn_sl_mult": _clean_float(last_row['dyn_sl_mult'], sl_mult, 2),
             "dyn_tp_mult": _clean_float(last_row['dyn_tp_mult'], tp_mult, 2)
@@ -1643,89 +1976,335 @@ def api_analyze(
 
 @app.get("/api/options_greeks")
 def api_options_greeks(
-    spot: float = Query(100.0), strike: float = Query(105.0), dte: int = Query(14), iv_pct: float = Query(55.0), r_pct: float = Query(4.25), gk_daily_vol_pct: float = Query(2.5), opt_type: str = Query("call")
+    spot: float = Query(100.0),
+    strike: float = Query(105.0),
+    dte: int = Query(14),
+    iv_pct: float = Query(55.0),
+    r_pct: float = Query(4.25),
+    gk_daily_vol_pct: float = Query(2.5),
+    opt_type: str = Query("call")
 ):
-    return black_scholes_analysis(S=spot, K=strike, days_to_expiry=dte, iv_pct=iv_pct, r_pct=r_pct, gk_daily_vol_pct=gk_daily_vol_pct, opt_type=opt_type)
+    return black_scholes_analysis(
+        S=spot, K=strike, days_to_expiry=dte,
+        iv_pct=iv_pct, r_pct=r_pct,
+        gk_daily_vol_pct=gk_daily_vol_pct, opt_type=opt_type
+    )
 
 
 # ==============================================================================
-# 6. FRONTEND SINGLE-PAGE APPLICATION (REPLAY HUD, SMART ZOOM, LIVE POLLING)
+# 6. FRONTEND SINGLE-PAGE APPLICATION
 # ==============================================================================
 HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Quant Strategy: Replay Engine, Dynamic SL/TP & Smart Trade Zoom</title>
+<title>Quant Strategy: EMA 200 Filter, 1m Live Auto-Refresh, 60d Options & Bar-by-Bar Replay</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
-  :root { --bg: #0b0e14; --panel: #131722; --border: #2a2e39; --text: #d1d4dc; --muted: #787b86; --accent: #2962ff; --green: #00e676; --red: #ff1744; --gold: #ffd600; }
+  :root {
+    --bg: #0b0e14;
+    --panel: #131722;
+    --border: #2a2e39;
+    --text: #d1d4dc;
+    --muted: #787b86;
+    --accent: #2962ff;
+    --green: #00e676;
+    --red: #ff1744;
+    --gold: #ffd600;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; font-size: 13px; }
 
   .sidebar {
-    width: 350px; background: var(--panel); border-right: 1px solid var(--border);
-    overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px;
-    transition: width 0.2s ease, padding 0.2s ease; flex-shrink: 0;
+    width: 355px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: width 0.2s ease, padding 0.2s ease;
+    flex-shrink: 0;
   }
-  .sidebar.collapsed { width: 0; padding: 0; border-right: none; overflow: hidden; }
+  .sidebar.collapsed {
+    width: 0;
+    padding: 0;
+    border-right: none;
+    overflow: hidden;
+  }
 
-  details.fold-card { background: #1a1f2e; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
-  details.fold-card > summary { font-weight: 700; font-size: 11.5px; text-transform: uppercase; color: #90a4ae; letter-spacing: 0.5px; cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; user-select: none; }
+  details.fold-card {
+    background: #1a1f2e;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+  details.fold-card > summary {
+    font-weight: 700;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    color: #90a4ae;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    user-select: none;
+  }
   details.fold-card > summary::-webkit-details-marker { display: none; }
-  details.fold-card > summary::after { content: "▼"; font-size: 10px; color: var(--muted); transition: transform 0.15s ease; }
-  details.fold-card:not([open]) > summary::after { transform: rotate(-90deg); }
-  details.fold-card[open] > summary { margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  details.fold-card > summary::after {
+    content: "▼";
+    font-size: 10px;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+  }
+  details.fold-card:not([open]) > summary::after {
+    transform: rotate(-90deg);
+  }
+  details.fold-card[open] > summary {
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
 
   label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; margin-top: 6px; }
-  input[type="text"], input[type="number"], select { width: 100%; background: #0b0e14; border: 1px solid var(--border); color: var(--text); padding: 5px 8px; border-radius: 4px; font-size: 12px; }
+  input[type="text"], input[type="number"], select {
+    width: 100%;
+    background: #0b0e14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
   .chk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 4px; }
   .chk-item { display: flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer; }
-  button.btn { background: var(--accent); color: #fff; border: none; border-radius: 4px; padding: 6px 10px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; font-size: 12px; }
+
+  button.btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+    margin-top: 8px;
+    font-size: 12px;
+  }
   button.btn:hover { opacity: 0.9; }
   button.btn-sec { background: #2a2e39; color: var(--text); }
+  button.btn-long { background: #00c853; color: #000; font-weight: 700; }
+  button.btn-short { background: #ff1744; color: #fff; font-weight: 700; }
 
-  .main { flex: 1; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; position: relative; }
-  .topbar { background: var(--panel); border-bottom: 1px solid var(--border); padding: 6px 12px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+  .main { flex: 1; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; }
+  .topbar {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 6px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-shrink: 0;
+  }
   .left-nav { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .toggle-btn { background: #262b3d; border: 1px solid #363c4e; color: var(--text); padding: 4px 9px; border-radius: 4px; font-size: 11px; cursor: pointer; font-weight: 600; }
+  .toggle-btn {
+    background: #262b3d;
+    border: 1px solid #363c4e;
+    color: var(--text);
+    padding: 4px 9px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    font-weight: 600;
+  }
   .toggle-btn:hover { background: #323950; }
 
   .breadcrumbs { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-  .crumb { background: #1e2433; border: 1px solid #363c4e; color: var(--text); padding: 3px 8px; border-radius: 4px; font-size: 11px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .crumb {
+    background: #1e2433;
+    border: 1px solid #363c4e;
+    color: var(--text);
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
   .crumb.active { background: var(--accent); border-color: var(--accent); font-weight: 700; }
-  .crumb-close { font-weight: bold; color: #ff8a80; cursor: pointer; padding: 0 3px; border-radius: 3px; font-size: 12px; line-height: 1; }
+  .crumb-close {
+    font-weight: bold;
+    color: #ff8a80;
+    cursor: pointer;
+    padding: 0 3px;
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1;
+  }
   .crumb-close:hover { background: rgba(255, 23, 68, 0.35); color: #fff; }
-  .crumb-clear { background: rgba(255, 23, 68, 0.15); border: 1px solid rgba(255, 23, 68, 0.4); color: #ff8a80; padding: 3px 7px; border-radius: 4px; font-size: 10.5px; cursor: pointer; }
-  .tf-selector { display: flex; gap: 4px; align-items: center; }
-  .tf-btn { background: #1a1f2e; border: 1px solid var(--border); color: var(--muted); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600; }
+  .crumb-clear {
+    background: rgba(255, 23, 68, 0.15);
+    border: 1px solid rgba(255, 23, 68, 0.4);
+    color: #ff8a80;
+    padding: 3px 7px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    cursor: pointer;
+  }
+
+  .tf-selector { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .tf-btn {
+    background: #1a1f2e;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+  }
   .tf-btn.active { background: #00b0ff; color: #000; border-color: #00b0ff; }
 
-  .alert-banner { background: rgba(255, 152, 0, 0.15); border-bottom: 1px solid #ff9800; color: #ffb74d; padding: 5px 14px; font-size: 11.5px; display: none; flex-shrink: 0; }
-
-  .chart-wrapper { position: relative; width: 100%; flex: 1; min-height: 440px; background: #0b0e14; border-bottom: 1px solid var(--border); }
-  #tv-chart { width: 100%; height: 100%; }
-  #overlay-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
-  
-  .chart-legend { position: absolute; top: 10px; left: 14px; z-index: 20; background: rgba(19, 23, 34, 0.88); padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45; }
-  .floating-hud { position: absolute; top: 10px; right: 72px; z-index: 25; width: 315px; background: rgba(15, 19, 28, 0.94); border: 1px solid #363c4e; border-radius: 6px; padding: 9px 11px; pointer-events: none; font-size: 11px; line-height: 1.45; box-shadow: 0 6px 18px rgba(0,0,0,0.5); display: none; }
-  .hud-header { font-weight: 700; font-size: 11.5px; color: #00b0ff; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 5px; display: flex; justify-content: space-between; }
-  .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px; }
-  .hud-size-box { margin-top: 6px; padding-top: 5px; border-top: 1px dashed #363c4e; color: #ffd600; font-size: 11px; }
-
-  /* Floating Replay HUD */
-  #replay-bar {
-    display: none; position: absolute; bottom: 300px; left: 50%; transform: translateX(-50%);
-    background: rgba(19, 23, 34, 0.98); border: 1px solid #00b0ff; border-radius: 8px; padding: 12px;
-    z-index: 50; gap: 10px; align-items: center; box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+  .live-badge {
+    background: rgba(0, 230, 118, 0.14);
+    border: 1px solid rgba(0, 230, 118, 0.45);
+    color: #00e676;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 600;
   }
-  #replay-bar button { width: auto; margin: 0; padding: 6px 12px; font-weight: bold; }
 
-  .bottom-panels { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
-  .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
+  /* Bar-by-Bar Replay & Manual Trade Deck */
+  .replay-bar {
+    background: #161b28;
+    border-bottom: 1px solid var(--border);
+    padding: 6px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .replay-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .rp-btn {
+    background: #23293a;
+    border: 1px solid #3a4259;
+    color: var(--text);
+    padding: 4px 9px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .rp-btn:hover { background: #2f374d; }
+  .rp-btn.active { background: var(--gold); color: #000; border-color: var(--gold); }
+  .rp-buy { background: rgba(0, 230, 118, 0.2); border-color: #00e676; color: #00e676; }
+  .rp-buy:hover { background: #00e676; color: #000; }
+  .rp-short { background: rgba(255, 23, 68, 0.2); border-color: #ff1744; color: #ff8a80; }
+  .rp-short:hover { background: #ff1744; color: #fff; }
+  .rp-close { background: rgba(255, 214, 0, 0.18); border-color: #ffd600; color: #ffd600; }
 
+  .alert-banner {
+    background: rgba(255, 152, 0, 0.15);
+    border-bottom: 1px solid #ff9800;
+    color: #ffb74d;
+    padding: 5px 14px;
+    font-size: 11.5px;
+    display: none;
+    flex-shrink: 0;
+  }
+
+  .chart-wrapper {
+    position: relative;
+    width: 100%;
+    flex: 1;
+    min-height: 430px;
+    background: #0b0e14;
+    border-bottom: 1px solid var(--border);
+  }
+  #tv-chart { width: 100%; height: 100%; }
+  #overlay-canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 10;
+  }
+  .chart-legend {
+    position: absolute;
+    top: 10px; left: 14px;
+    z-index: 20;
+    background: rgba(19, 23, 34, 0.88);
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    pointer-events: none;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+
+  .floating-hud {
+    position: absolute;
+    top: 10px;
+    right: 72px;
+    z-index: 25;
+    width: 325px;
+    background: rgba(15, 19, 28, 0.94);
+    border: 1px solid #363c4e;
+    border-radius: 6px;
+    padding: 9px 11px;
+    pointer-events: none;
+    font-size: 11px;
+    line-height: 1.45;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+    display: none;
+  }
+  .hud-header {
+    font-weight: 700;
+    font-size: 11.5px;
+    color: #00b0ff;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 5px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .hud-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3px 10px;
+  }
+  .hud-size-box {
+    margin-top: 6px;
+    padding-top: 5px;
+    border-top: 1px dashed #363c4e;
+    color: #ffd600;
+    font-size: 11px;
+  }
+
+  .bottom-panels {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .bottom-grid {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr;
+    gap: 10px;
+  }
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
   th, td { padding: 5px 7px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--muted); font-weight: 600; background: #161b26; position: sticky; top: 0; z-index: 2; }
@@ -1746,10 +2325,10 @@ HTML_PAGE = r"""
 <div class="sidebar" id="sidebar">
 
   <details class="fold-card" open>
-    <summary>1. Asset, Side & Mode Selection</summary>
+    <summary>1. Asset, Side, EMA 200 Filter & Click Action</summary>
     <div class="row-2">
       <div>
-        <label>Ticker (e.g. SNDK, NVDA)</label>
+        <label>Ticker (e.g. SNDK, NVDA, ASTS)</label>
         <input type="text" id="ticker" value="SNDK">
       </div>
       <div>
@@ -1761,22 +2340,33 @@ HTML_PAGE = r"""
         </select>
       </div>
     </div>
-    <label>Interaction Mode</label>
-    <select id="clickMode" onchange="toggleReplayUI()">
-      <option value="drill">Standard View & Drill-Down</option>
-      <option value="replay">Interactive Paper Trading Replay Mode</option>
+
+    <label style="color:#ffd600; font-weight:600;">EMA 200 Trend Filter (Applies to All Strategies)</label>
+    <select id="ema200_filter" onchange="loadChartData()">
+      <option value="none" selected>No EMA 200 Filter (Allow All Signals)</option>
+      <option value="trend_follow">Trend-Following: Ignore Long &lt; EMA200 &amp; Ignore Short &gt; EMA200</option>
+      <option value="counter_trend">Counter-Trend: Only Short &gt; EMA200 (Uptrend) &amp; Long &lt; EMA200 (Downtrend)</option>
+    </select>
+
+    <label>Candle Click Action</label>
+    <select id="clickMode">
+      <option value="drill">Drill-Down Timeframe (1Y->1M->1W->1D->1H->15m->5m->1m)</option>
+      <option value="replay_here">Start Bar-by-Bar Replay From Clicked Candle</option>
+      <option value="manual_long">Single-Click Manual BUY (Long TP/SL)</option>
+      <option value="manual_short">Single-Click Manual SHORT (Short TP/SL)</option>
+      <option value="cutoff">Set Point-in-Time Cutoff Date</option>
     </select>
     <div class="row-2" style="margin-top:4px;">
       <button class="btn" onclick="resetToRoot()">Load Max History</button>
-      <button class="btn btn-sec" onclick="clearCutoffAndManual()">Reset Zoom</button>
+      <button class="btn btn-sec" onclick="clearCutoffAndManual()">Reset Zoom/Replay</button>
     </div>
   </details>
 
   <details class="fold-card" open>
-    <summary>2. Strategy & Dynamic SL/TP</summary>
+    <summary>2. Strategy & Dynamic SL/TP Formula</summary>
     <label>Active Strategy</label>
     <select id="strategy" onchange="onStrategyChange()">
-      <option value="trend">1. Core Trend (EMA 20/50 + Volume L/S)</option>
+      <option value="trend">1. Core Trend (EMA 20/50/200 + Volume L/S)</option>
       <option value="watch_dip">2. Watch -> Pullback/Rally -> Buy/Short</option>
       <option value="smc_fvg">3. SMC & Fair Value Gaps (Bull/Bear FVG)</option>
       <option value="fib_golden">4. Fibonacci Golden Pocket (0.618 / 0.382)</option>
@@ -1784,19 +2374,14 @@ HTML_PAGE = r"""
       <option value="do_t">6. Intraday 'Do T' (VWAP +-2 Sigma L/S)</option>
       <option value="composite">7. Composite Score (a*A + b*B + c*C)</option>
       <option value="scale_ladder">8. Momentum Scale-Out Ladder (Sell xx% @ +xx%)</option>
-      <option value="plain_tpsl">9. Replay / Manual Sandbox</option>
+      <option value="plain_tpsl">9. Plain TP/SL & Manual Replay Sandbox</option>
     </select>
-    
-    <label class="chk-item" style="margin-top:8px; margin-bottom:6px; color:#00e676; font-weight:600;">
-      <input type="checkbox" id="chk_ema200_filter" onchange="loadChartData()">
-      Enable EMA 200 Trend Filter (Suppress Counter-Trend)
-    </label>
 
     <div class="row-2" style="margin-top:6px;">
       <div>
         <label>SL/TP Mode</label>
         <select id="dynamic_tpsl" onchange="loadChartData()">
-          <option value="true" selected>Dynamic Formula</option>
+          <option value="true" selected>Dynamic Formula (Regime+Vol)</option>
           <option value="false">Fixed Multipliers</option>
         </select>
       </div>
@@ -1811,22 +2396,29 @@ HTML_PAGE = r"""
 
     <div class="row-2" style="margin-top:4px;">
       <div>
-        <label>Base SL Mult</label>
+        <label>Base SL Mult (Anchor)</label>
         <input type="number" id="sl_mult" value="1.5" step="0.25">
       </div>
       <div>
-        <label>Base TP Mult</label>
+        <label>Base TP Mult (Anchor)</label>
         <input type="number" id="tp_mult" value="2.8" step="0.25">
       </div>
     </div>
-    <button class="btn" onclick="loadChartData()">Apply Strategy</button>
+
+    <label style="margin-top:8px;">Composite Weights (Alpha / Beta / Gamma)</label>
+    <div class="row-3">
+      <div><label>a (Trend)</label><input type="number" id="w_trend" value="0.4" step="0.1"></div>
+      <div><label>b (Liquid)</label><input type="number" id="w_liq" value="0.4" step="0.1"></div>
+      <div><label>g (VWAP)</label><input type="number" id="w_rev" value="0.2" step="0.1"></div>
+    </div>
+    <button class="btn" onclick="loadChartData()">Apply Strategy & Formula</button>
   </details>
 
   <details class="fold-card" open>
-    <summary>3. Scale-Out Profit Ladder</summary>
+    <summary>3. Scale-Out Profit Ladder (All Strategies)</summary>
     <label class="chk-item" style="margin-bottom:6px; color:#00e676; font-weight:600;">
       <input type="checkbox" id="enable_scale_out" checked onchange="loadChartData()">
-      Apply Multi-Tranche Scale-Out to Strategy
+      Apply Multi-Tranche Scale-Out to Every Strategy & Replay
     </label>
     <div class="row-2">
       <div>
@@ -1848,17 +2440,20 @@ HTML_PAGE = r"""
         <input type="number" id="t2_sell_pct" value="35" step="5" onchange="loadChartData()">
       </div>
     </div>
+    <div style="font-size:10.5px; color:var(--muted); margin-top:5px;">
+      * Remaining shares ride to Dynamic TP with Stop-Loss ratcheted to Breakeven (at T1) and T1 Price (at T2).
+    </div>
   </details>
 
   <details class="fold-card" open>
-    <summary>4. Dual-Pool Portfolio Control</summary>
+    <summary>4. Dual-Pool Portfolio & Replay Allocation</summary>
     <div class="row-2">
       <div>
         <label>Starting Capital ($)</label>
         <input type="number" id="initial_capital" value="100000" step="10000" onchange="loadChartData()">
       </div>
       <div>
-        <label>Risk / Trade (%)</label>
+        <label>Auto Risk / Trade (%)</label>
         <input type="number" id="risk_pct" value="1.25" step="0.25" onchange="loadChartData()">
       </div>
     </div>
@@ -1872,23 +2467,27 @@ HTML_PAGE = r"""
         <input type="number" id="intraday_pct" value="30" step="5" onchange="loadChartData()">
       </div>
     </div>
+    <div style="margin-top:6px; padding-top:6px; border-top:1px dashed var(--border);">
+      <label style="color:#00e5ff; font-weight:600;">Manual Bar-by-Bar Replay Trade Allocation (% of Total Portfolio)</label>
+      <input type="number" id="manual_alloc_pct" value="25" min="1" max="100" step="5" onchange="syncAllocInput(this.value)">
+    </div>
   </details>
 
   <details class="fold-card">
-    <summary>5. Selectable Overlays</summary>
+    <summary>5. Selectable Overlays & Zones</summary>
     <div class="chk-grid">
       <label class="chk-item"><input type="checkbox" id="chk_ema20" checked onchange="renderOverlays()"> EMA 20 & 50</label>
-      <label class="chk-item"><input type="checkbox" id="chk_ema200" checked onchange="renderOverlays()"> EMA 200</label>
+      <label class="chk-item"><input type="checkbox" id="chk_ema200" checked onchange="renderOverlays()"> EMA 200 (Gold)</label>
       <label class="chk-item"><input type="checkbox" id="chk_vwap" onchange="renderOverlays()"> Session VWAP</label>
-      <label class="chk-item"><input type="checkbox" id="chk_vwap_bands" onchange="renderOverlays()"> VWAP +-2s</label>
-      <label class="chk-item"><input type="checkbox" id="chk_atr_bands" checked onchange="renderOverlays()"> Dyn SL Band</label>
-      <label class="chk-item"><input type="checkbox" id="chk_gk_bands" checked onchange="renderOverlays()"> Dyn TP Cone</label>
-      <label class="chk-item"><input type="checkbox" id="chk_fib_levels" onchange="renderOverlays()"> Fibonacci</label>
+      <label class="chk-item"><input type="checkbox" id="chk_vwap_bands" onchange="renderOverlays()"> VWAP +-2s Bands</label>
+      <label class="chk-item"><input type="checkbox" id="chk_atr_bands" checked onchange="renderOverlays()"> Dyn SL ATR Band</label>
+      <label class="chk-item"><input type="checkbox" id="chk_gk_bands" checked onchange="renderOverlays()"> Dyn TP GK Cone</label>
+      <label class="chk-item"><input type="checkbox" id="chk_fib_levels" onchange="renderOverlays()"> Fibonacci Levels</label>
       <label class="chk-item"><input type="checkbox" id="chk_orb_levels" onchange="renderOverlays()"> ORB High/Low</label>
-      <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> FVG Boxes</label>
-      <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> TP/SL Boxes</label>
+      <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> SMC FVG Boxes</label>
+      <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
       <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
-      <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating HUD</label>
+      <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating Hover HUD</label>
     </div>
   </details>
 
@@ -1904,6 +2503,7 @@ HTML_PAGE = r"""
       <div class="breadcrumbs" id="breadcrumb-bar"></div>
     </div>
     <div class="tf-selector" id="tf-buttons">
+      <span class="live-badge" id="live-refresh-badge" title="1m chart data & 60-day Option Chain auto-refresh every 60s">⟳ 1m & Options Sync: 60s</span>
       <button class="tf-btn active" onclick="switchTF('1Y')">1Y</button>
       <button class="tf-btn" onclick="switchTF('1M')">1M</button>
       <button class="tf-btn" onclick="switchTF('1W')">1W</button>
@@ -1911,7 +2511,35 @@ HTML_PAGE = r"""
       <button class="tf-btn" onclick="switchTF('1h')">1H</button>
       <button class="tf-btn" onclick="switchTF('15m')">15m</button>
       <button class="tf-btn" onclick="switchTF('5m')">5m</button>
-      <button class="tf-btn" onclick="switchTF('1m')">1m (Live Poll)</button>
+      <button class="tf-btn" onclick="switchTF('1m')">1m</button>
+    </div>
+  </div>
+
+  <!-- ==================== BAR-BY-BAR REPLAY & MANUAL PORTFOLIO % EXECUTION BAR ==================== -->
+  <div class="replay-bar">
+    <div class="replay-controls">
+      <span style="font-weight:700; color:#00b0ff; font-size:11.5px;">🎬 BAR-BY-BAR REPLAY:</span>
+      <button class="rp-btn" id="btn-replay-start" onclick="startBarReplay()">⏮ Start Replay</button>
+      <button class="rp-btn" onclick="stepReplay(-1)" title="Step Back 1 Stick">◀ -1 Bar</button>
+      <button class="rp-btn" onclick="stepReplay(1)" title="Advance Forward 1 Stick">▶ +1 Bar (Next Stick)</button>
+      <button class="rp-btn" id="btn-replay-play" onclick="toggleReplayAutoPlay()">⏯ Auto-Play</button>
+      <select id="replay_speed" style="width:78px; padding:3px 5px; font-size:11px;" onchange="if(replayTimer){toggleReplayAutoPlay(); toggleReplayAutoPlay();}">
+        <option value="800">0.8s / bar</option>
+        <option value="400" selected>0.4s / bar</option>
+        <option value="180">0.18s / bar</option>
+      </select>
+      <button class="rp-btn" onclick="stopBarReplay()">⏹ Exit Replay</button>
+      <span id="replay-status-text" style="color:var(--gold); font-weight:600; font-size:11px; margin-left:4px;">[Full History Mode]</span>
+    </div>
+
+    <div class="replay-controls">
+      <span style="font-size:11px; color:var(--muted);">Order Size (% Total Equity):</span>
+      <input type="number" id="top_alloc_pct" value="25" min="1" max="100" step="5" style="width:62px; padding:3px 6px;" onchange="syncAllocInput(this.value)">
+      <span style="font-size:11px; color:var(--muted);">%</span>
+      <button class="rp-btn rp-buy" onclick="executeManualReplayOrder('LONG')">▲ BUY LONG (@ % Equity)</button>
+      <button class="rp-btn rp-short" onclick="executeManualReplayOrder('SHORT')">▼ SELL SHORT (@ % Equity)</button>
+      <button class="rp-btn rp-close" id="btn-close-manual" onclick="closeManualReplayPosition()" style="display:none;">✖ CLOSE OPEN POS</button>
+      <button class="rp-btn" onclick="clearManualReplayHistory()" title="Clear manual replay trades">🗑 Reset Manual</button>
     </div>
   </div>
 
@@ -1921,39 +2549,40 @@ HTML_PAGE = r"""
   <div class="chart-wrapper" id="chart-wrap">
     <div class="chart-legend" id="chart-legend">Loading...</div>
     <div class="floating-hud" id="floating-hud"></div>
-    
-    <!-- REPLAY HUD -->
-    <div id="replay-bar">
-      <button class="btn" id="btn-play" style="background:#00b0ff;" onclick="togglePlay()">▶ Play</button>
-      <button class="btn" style="background:#2a2e39;" onclick="stepReplay()">⏭ Step</button>
-      <div style="width:1px; height:24px; background:#363c4e; margin:0 5px;"></div>
-      <span style="color:#fff;">Size:</span>
-      <input type="number" id="replay-pct" value="10" step="5" style="width:60px;"> <span style="color:#fff;">%</span>
-      <button class="btn" style="background:#00e676;" onclick="placeTrade('long')">BUY</button>
-      <button class="btn" style="background:#ff1744;" onclick="placeTrade('short')">SHORT</button>
-      <button class="btn" style="background:#ff9800;" onclick="placeTrade('close')">CLOSE</button>
-    </div>
-
     <div id="tv-chart"></div>
     <canvas id="overlay-canvas"></canvas>
   </div>
 
   <!-- Foldable Bottom Panels -->
   <div class="bottom-panels">
+
     <!-- Panel A: Detailed Trade Execution Log -->
     <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
       <summary>
-        <span>Trade Execution Log & Scale-Out Ladder (Click Row to Smart-Zoom Trade on Chart)</span>
+        <span>Active Strategy & Bar-by-Bar Replay Trade Execution Log (Click Any Row to Smart-Zoom Trade on Chart)</span>
         <span id="trade-count-badge" style="color:#00e676; margin-right:10px;"></span>
       </summary>
       <div style="overflow-x:auto; max-height:195px;">
         <table id="trade-log-table">
           <thead>
             <tr>
-              <th>#</th><th>Side</th><th>Signal</th><th>Pool</th><th>Entry Time</th><th>Entry $</th>
-              <th>Initial Shares</th><th>Position Value</th><th>Dollar Risk</th><th>SL / TP ($)</th>
-              <th>Scale-Out Ladder</th><th>Exit Time</th><th>Exit $</th><th>Result</th>
-              <th>Net PnL ($)</th><th>Return %</th><th>Total Equity</th>
+              <th>#</th>
+              <th>Side</th>
+              <th>Signal (Dyn SL/TP)</th>
+              <th>Bucket Pool</th>
+              <th>Entry Time</th>
+              <th>Entry $</th>
+              <th>Initial Shares</th>
+              <th>Position Value (% Eq)</th>
+              <th>Dollar Risk</th>
+              <th>SL / TP ($)</th>
+              <th>Scale-Out Ladder</th>
+              <th>Exit Time</th>
+              <th>Exit $</th>
+              <th>Result</th>
+              <th>Net PnL ($)</th>
+              <th>Return %</th>
+              <th>Total Equity</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -1971,20 +2600,31 @@ HTML_PAGE = r"""
         <div style="overflow-x:auto; max-height:190px;">
           <table id="summary-table">
             <thead>
-              <tr><th>Strategy</th><th>Pool</th><th>Ending Equity</th><th>Net Return</th><th>Trades (L / S)</th><th>Win Rate</th><th>Profit Factor</th><th>Max DD</th></tr>
+              <tr>
+                <th>Strategy</th>
+                <th>Pool</th>
+                <th>Ending Equity</th>
+                <th>Net Return</th>
+                <th>Trades (L / S)</th>
+                <th>Win Rate</th>
+                <th>Profit Factor</th>
+                <th>Max DD</th>
+              </tr>
             </thead>
             <tbody></tbody>
           </table>
         </div>
       </details>
 
-      <!-- Panel C: Options Greeks -->
+      <!-- Panel C: Options Greeks & Expectancy Calculator -->
       <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
         <summary>Options Greeks & Implied Expectancy Calculator</summary>
         <div class="row-3">
           <div><label>Spot ($)</label><input type="number" id="opt_spot" value="100" step="1"></div>
           <div><label>Strike ($)</label><input type="number" id="opt_strike" value="105" step="1"></div>
-          <div><label>Type</label><select id="opt_type"><option value="call">CALL</option><option value="put">PUT</option></select></div>
+          <div><label>Type</label>
+            <select id="opt_type"><option value="call">CALL</option><option value="put">PUT</option></select>
+          </div>
         </div>
         <div class="row-3">
           <div><label>DTE (Days)</label><input type="number" id="opt_dte" value="14"></div>
@@ -1996,27 +2636,35 @@ HTML_PAGE = r"""
       </details>
     </div>
 
-    <!-- Panel D: Live Yahoo Option Chain Browser -->
-    <details class="fold-card bottom-fold" ontoggle="resizeChart()">
+    <!-- Panel D: Live Yahoo Option Chain Browser (Up to 60 Days + 1m Auto-Refresh) -->
+    <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
       <summary>
-        <span>Live Option Chain Browser (Up to 60 Days - Click to Expand)</span>
+        <span>Live Option Chain Browser (Up to 60 Days DTE — Auto-Updates Every 1m) & 60-Day Contract History</span>
         <span id="chain-source" style="color:var(--muted); font-weight:normal; font-size:10.5px; margin-right:10px;"></span>
       </summary>
-      <div style="display:flex; justify-content:flex-end; margin-bottom:6px;">
-        <select id="chain_expiry" style="width:150px;" onchange="loadOptionChain(this.value)"></select>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <span style="font-size:11px; color:#80d8ff;">Showing all Option Expirations up to 60 Days Out (Click any strike to inspect 60-day history & Greeks)</span>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <span style="font-size:11px; color:var(--muted);">Expiration (<= 60d):</span>
+          <select id="chain_expiry" style="width:160px;" onchange="loadOptionChain(this.value)"></select>
+        </div>
       </div>
       <div class="row-2" style="gap:14px;">
         <div style="max-height:190px; overflow-y:auto;">
-          <div style="font-weight:700; color:var(--green); margin-bottom:4px;">CALLS (Click row for contract history)</div>
+          <div style="font-weight:700; color:var(--green); margin-bottom:4px;">CALLS (Click row for 60d contract history)</div>
           <table id="calls-table">
-            <thead><tr><th>Strike</th><th>Last</th><th>Bid/Ask</th><th>IV%</th><th>Delta</th><th>Vol/OI</th><th>Valuation</th></tr></thead>
+            <thead>
+              <tr><th>Strike</th><th>DTE</th><th>Last</th><th>Bid/Ask</th><th>IV%</th><th>Delta</th><th>Vol/OI</th><th>Valuation</th></tr>
+            </thead>
             <tbody></tbody>
           </table>
         </div>
         <div style="max-height:190px; overflow-y:auto;">
-          <div style="font-weight:700; color:var(--red); margin-bottom:4px;">PUTS (Click row for contract history)</div>
+          <div style="font-weight:700; color:var(--red); margin-bottom:4px;">PUTS (Click row for 60d contract history)</div>
           <table id="puts-table">
-            <thead><tr><th>Strike</th><th>Last</th><th>Bid/Ask</th><th>IV%</th><th>Delta</th><th>Vol/OI</th><th>Valuation</th></tr></thead>
+            <thead>
+              <tr><th>Strike</th><th>DTE</th><th>Last</th><th>Bid/Ask</th><th>IV%</th><th>Delta</th><th>Vol/OI</th><th>Valuation</th></tr>
+            </thead>
             <tbody></tbody>
           </table>
         </div>
@@ -2026,6 +2674,7 @@ HTML_PAGE = r"""
         <div id="contract-hist-strip" style="display:flex; gap:6px; overflow-x:auto; padding-bottom:4px;"></div>
       </div>
     </details>
+
   </div>
 </div>
 
@@ -2044,12 +2693,22 @@ let breadcrumbs = [{ label: "Max (1Y)", tf: "1Y", startTs: null }];
 let activeCrumbIdx = 0;
 let allPanelsFolded = false;
 
-// Replay State & Polling
-let isReplay = false;
-let replayIdx = 0;
+// --- BAR-BY-BAR REPLAY & MANUAL PORTFOLIO % EXECUTION STATE ---
+let replayActive = false;
+let replayIndex = 0;
 let replayTimer = null;
-let manualTrades = [];
-let pollTimer = null;
+let manualReplayOrders = []; // [{ entryIdx, side: 'LONG'|'SHORT', allocPct: 25, forceCloseIdx: null }]
+let manualSimResult = null;  // Holds computed trades/markers/boxes/stats for manual replay orders
+
+// --- 1-MINUTE AUTO-REFRESH STATE (FOR 1m CHART & 60-DAY OPTIONS) ---
+let liveRefreshCountdown = 60;
+let lastSelectedOptionContract = null;
+
+function syncAllocInput(val) {
+  const clean = Math.max(1, Math.min(100, parseFloat(val) || 25));
+  document.getElementById('manual_alloc_pct').value = clean;
+  document.getElementById('top_alloc_pct').value = clean;
+}
 
 function toggleSidebar() {
   const sb = document.getElementById('sidebar');
@@ -2097,29 +2756,34 @@ function initChart() {
   });
 
   candleSeries = chart.addCandlestickSeries({
-    upColor: '#00e676', downColor: '#ff1744', borderUpColor: '#00e676', borderDownColor: '#ff1744', wickUpColor: '#00e676', wickDownColor: '#ff1744'
+    upColor: '#00e676', downColor: '#ff1744',
+    borderUpColor: '#00e676', borderDownColor: '#ff1744',
+    wickUpColor: '#00e676', wickDownColor: '#ff1744'
   });
 
-  volumeSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: '' });
+  volumeSeries = chart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: ''
+  });
   volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
   const lineConfigs = {
-    ema20: { color: '#2962ff', lineWidth: 2, title: 'EMA 20' },
-    ema50: { color: '#ff9800', lineWidth: 2, title: 'EMA 50' },
-    ema200: { color: '#ff4081', lineWidth: 2, title: 'EMA 200' },
-    vwap: { color: '#e040fb', lineWidth: 2, title: 'VWAP' },
-    vwap_u2: { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP +2s' },
-    vwap_l2: { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP -2s' },
+    ema20:     { color: '#2962ff', lineWidth: 2, title: 'EMA 20' },
+    ema50:     { color: '#ff9800', lineWidth: 2, title: 'EMA 50' },
+    ema200:    { color: '#ffd600', lineWidth: 2, title: 'EMA 200' },
+    vwap:      { color: '#e040fb', lineWidth: 2, title: 'VWAP' },
+    vwap_u2:   { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP +2s' },
+    vwap_l2:   { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP -2s' },
     atr_upper: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'Dyn SL Upper' },
     atr_lower: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'Dyn SL Lower' },
-    gk_upper: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Upper' },
-    gk_lower: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Lower' },
-    fib_382: { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.382' },
-    fib_500: { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.500' },
-    fib_618: { color: '#ffd600', lineWidth: 2, title: 'Fib 0.618 Golden' },
-    fib_786: { color: 'rgba(255,23,68,0.5)', lineWidth: 1, title: 'Fib 0.786' },
-    orb_high: { color: '#00e676', lineWidth: 1, lineStyle: 2, title: 'ORB High' },
-    orb_low: { color: '#ff1744', lineWidth: 1, lineStyle: 2, title: 'ORB Low' }
+    gk_upper:  { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Upper' },
+    gk_lower:  { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Lower' },
+    fib_382:   { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.382' },
+    fib_500:   { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.500' },
+    fib_618:   { color: '#ffd600', lineWidth: 2, title: 'Fib 0.618 Golden' },
+    fib_786:   { color: 'rgba(255,23,68,0.5)', lineWidth: 1, title: 'Fib 0.786' },
+    orb_high:  { color: '#00e676', lineWidth: 1, lineStyle: 2, title: 'ORB High' },
+    orb_low:   { color: '#ff1744', lineWidth: 1, lineStyle: 2, title: 'ORB Low' }
   };
 
   for (const [k, cfg] of Object.entries(lineConfigs)) {
@@ -2133,36 +2797,51 @@ function initChart() {
   chart.subscribeCrosshairMove((param) => {
     const hud = document.getElementById('floating-hud');
     const showHud = document.getElementById('chk_hover_hud').checked;
-    if (!showHud || !param || !param.time || !currentData || !currentData.bar_details) { hud.style.display = 'none'; return; }
+    if (!showHud || !param || !param.time || !currentData || !currentData.bar_details) {
+      hud.style.display = 'none';
+      return;
+    }
     const b = currentData.bar_details[String(param.time)];
-    if (!b) { hud.style.display = 'none'; return; }
+    if (!b) {
+      hud.style.display = 'none';
+      return;
+    }
     hud.style.display = 'block';
     const chgColor = b.chg_pct >= 0 ? '#00e676' : '#ff1744';
     const regColor = b.regime.includes('UNCLEAR') ? '#ffb74d' : (b.regime.includes('BULL') ? '#00e676' : '#ff1744');
+    const ema200Color = b.vs_ema200.includes('ABOVE') ? '#00e676' : '#ff1744';
     hud.innerHTML = `
       <div class="hud-header">
         <span>${currentData.ticker} [${currentData.tf}] — ${b.dt}</span>
         <span style="color:${chgColor}">${b.chg_pct >= 0 ? '+' : ''}${b.chg_pct}%</span>
       </div>
       <div class="hud-grid">
-        <div><b>Open:</b> $${b.o}</div><div><b>High:</b> $${b.h}</div><div><b>Low:</b> $${b.l}</div><div><b>Close:</b> $${b.c}</div>
-        <div><b>Volume:</b> ${b.vol.toLocaleString()}</div><div><b>RVOL:</b> ${b.rvol}x</div>
-        <div><b>EMA 20/50:</b> $${b.ema20} / $${b.ema50}</div><div><b>VWAP:</b> $${b.vwap}</div>
-        <div><b>ATR (14):</b> $${b.atr}</div><div><b>GK Vol:</b> ${b.gk_pct}%</div>
+        <div><b>Open:</b> $${b.o}</div>
+        <div><b>High:</b> $${b.h}</div>
+        <div><b>Low:</b> $${b.l}</div>
+        <div><b>Close:</b> $${b.c}</div>
+        <div><b>Volume:</b> ${b.vol.toLocaleString()}</div>
+        <div><b>RVOL:</b> ${b.rvol}x</div>
+        <div><b>EMA 20/50:</b> $${b.ema20} / $${b.ema50}</div>
+        <div><b>EMA 200:</b> <span style="color:#ffd600;">$${b.ema200}</span></div>
+        <div><b>VWAP:</b> $${b.vwap}</div>
+        <div><b>ATR / GK:</b> $${b.atr} / ${b.gk_pct}%</div>
+        <div><b>RSI (14):</b> ${b.rsi}</div>
+        <div><b>Score:</b> ${b.score}</div>
       </div>
       <div style="margin-top:4px;">
-        <b>Regime:</b> <span style="color:${regColor}; font-weight:700;">${b.regime}</span> | <b>Dyn Mults:</b> <span style="color:#00e5ff;">${b.dyn_sl_mult}x SL / ${b.dyn_tp_mult}x TP</span>
+        <b>Regime:</b> <span style="color:${regColor}; font-weight:700;">${b.regime}</span> |
+        <span style="color:${ema200Color}; font-weight:700;">${b.vs_ema200}</span>
       </div>
       <div class="hud-size-box">
-        <div><b>Position Size @ This Bar:</b> Buy/Short <b>${b.sug_shares.toLocaleString()} shares</b> ($${b.sug_pos_val.toLocaleString()})</div>
-        <div><b>Dollar Risk:</b> $${b.sug_risk} | <b>Long SL/TP:</b> $${b.long_sl} / $${b.long_tp}</div>
-        <div><b>Short SL/TP:</b> $${b.short_sl} / $${b.short_tp}</div>
+        <div><b>Auto Size @ Bar:</b> <b>${b.sug_shares.toLocaleString()} sh</b> ($${b.sug_pos_val.toLocaleString()}) | <b>Dyn:</b> ${b.dyn_sl_mult}x/${b.dyn_tp_mult}x</div>
+        <div><b>Long SL/TP:</b> $${b.long_sl} / $${b.long_tp} | <b>Short SL/TP:</b> $${b.short_sl} / $${b.short_tp}</div>
       </div>
     `;
   });
 
   chart.subscribeClick((param) => {
-    if (!param || !param.time || !currentData || isReplay) return;
+    if (!param || !param.time || !currentData) return;
     const clickedTs = param.time;
     const mode = document.getElementById('clickMode').value;
     const dtObj = new Date(clickedTs * 1000);
@@ -2171,113 +2850,434 @@ function initChart() {
     if (mode === 'drill') {
       const nextTf = currentData.next_tf;
       if (nextTf === currentTF && currentTF === '1m') return;
-      if (currentTF === '1Y') currentStartTs = Math.floor(Date.UTC(dtObj.getUTCFullYear(), 0, 1) / 1000);
-      else if (currentTF === '1M') currentStartTs = Math.floor(Date.UTC(dtObj.getUTCFullYear(), dtObj.getUTCMonth(), 1) / 1000);
-      else currentStartTs = clickedTs;
-
+      if (currentTF === '1Y') {
+        const yr = dtObj.getUTCFullYear();
+        currentStartTs = Math.floor(Date.UTC(yr, 0, 1) / 1000);
+      } else if (currentTF === '1M') {
+        const yr = dtObj.getUTCFullYear();
+        const mo = dtObj.getUTCMonth();
+        currentStartTs = Math.floor(Date.UTC(yr, mo, 1) / 1000);
+      } else {
+        currentStartTs = clickedTs;
+      }
       currentTF = nextTf;
       breadcrumbs = breadcrumbs.slice(0, activeCrumbIdx + 1);
       const existingIdx = breadcrumbs.findIndex(b => b.tf === currentTF);
       const newTab = { label: `${dtStr} (${currentTF})`, tf: currentTF, startTs: currentStartTs };
-      if (existingIdx !== -1) { breadcrumbs[existingIdx] = newTab; breadcrumbs = breadcrumbs.slice(0, existingIdx + 1); }
-      else breadcrumbs.push(newTab);
+      if (existingIdx !== -1) {
+        breadcrumbs[existingIdx] = newTab;
+        breadcrumbs = breadcrumbs.slice(0, existingIdx + 1);
+      } else {
+        breadcrumbs.push(newTab);
+      }
       activeCrumbIdx = breadcrumbs.length - 1;
+      loadChartData();
+    } else if (mode === 'replay_here') {
+      const idx = currentData.candles.findIndex(c => c.time === clickedTs);
+      if (idx !== -1) {
+        startBarReplay(idx);
+      }
+    } else if (mode === 'manual_long') {
+      document.getElementById('strategy').value = 'plain_tpsl';
+      manualEntryTs = clickedTs;
+      manualSide = 'long';
+      loadChartData();
+    } else if (mode === 'manual_short') {
+      document.getElementById('strategy').value = 'plain_tpsl';
+      manualEntryTs = clickedTs;
+      manualSide = 'short';
+      loadChartData();
+    } else if (mode === 'cutoff') {
+      currentCutoffTs = clickedTs;
       loadChartData();
     }
   });
 }
 
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => {
-    if (currentTF === '1m' && !isReplay) loadChartData(true); // Silent poll 1-min chart
-    if (!isReplay && document.getElementById('chain_expiry').options.length > 0) {
-       // Also poll option chain if active
-       loadOptionChain(document.getElementById('chain_expiry').value);
-    }
-  }, 60000);
-}
-
-function toggleReplayUI() {
-  isReplay = document.getElementById('clickMode').value === 'replay';
-  document.getElementById('replay-bar').style.display = isReplay ? 'flex' : 'none';
-  
-  if (isReplay) {
-    document.getElementById('strategy').value = 'plain_tpsl'; // Force Sandbox
-    replayIdx = Math.max(0, currentData.candles.length - 150);
-    renderSlicedChart();
-  } else {
-    manualTrades = [];
-    if (replayTimer) { clearInterval(replayTimer); replayTimer = null; document.getElementById('btn-play').textContent = "▶ Play"; }
-    loadChartData();
+// ==============================================================================
+// BAR-BY-BAR REPLAY ENGINE & MANUAL PORTFOLIO % SIMULATOR
+// ==============================================================================
+function startBarReplay(startIdx = null) {
+  if (!currentData || !currentData.candles || currentData.candles.length < 2) return;
+  replayActive = true;
+  if (startIdx !== null && startIdx >= 0 && startIdx < currentData.candles.length) {
+    replayIndex = startIdx;
+  } else if (!replayActive || replayIndex <= 0 || replayIndex >= currentData.candles.length - 1) {
+    // Start around 65% of the dataset or at least 30 bars in so indicators are warm
+    replayIndex = Math.max(1, Math.min(currentData.candles.length - 2, Math.floor(currentData.candles.length * 0.65)));
   }
+  document.getElementById('btn-replay-start').classList.add('active');
+  renderReplayFrame(true);
 }
 
-async function placeTrade(side) {
-  if (!currentData || replayIdx >= currentData.candles.length) return;
-  const ts = currentData.candles[replayIdx].time;
-  const pct = document.getElementById('replay-pct').value;
-  manualTrades.push({ ts, side, pct });
-  
-  let wasPlaying = !!replayTimer;
-  if (wasPlaying) { clearInterval(replayTimer); replayTimer = null; document.getElementById('btn-play').textContent = "▶ Play"; }
-  
-  await loadChartData(true);
-  renderSlicedChart(); // Update UI
-  
-  if (wasPlaying) togglePlay();
-}
-
-function stepReplay() {
-  if (replayIdx < currentData.candles.length - 1) {
-    replayIdx++;
-    renderSlicedChart();
-  } else if (replayTimer) {
-    togglePlay();
+function stepReplay(delta) {
+  if (!currentData || !currentData.candles || currentData.candles.length === 0) return;
+  if (!replayActive) {
+    startBarReplay();
+    return;
   }
+  const nextIdx = Math.max(0, Math.min(currentData.candles.length - 1, replayIndex + delta));
+  replayIndex = nextIdx;
+  renderReplayFrame(false);
 }
 
-function togglePlay() {
+function toggleReplayAutoPlay() {
+  const btn = document.getElementById('btn-replay-play');
   if (replayTimer) {
     clearInterval(replayTimer);
     replayTimer = null;
-    document.getElementById('btn-play').textContent = "▶ Play";
-  } else {
-    replayTimer = setInterval(stepReplay, 400); // 400ms per bar
-    document.getElementById('btn-play').textContent = "⏸ Pause";
+    btn.classList.remove('active');
+    btn.textContent = '⏯ Auto-Play';
+    return;
+  }
+  if (!replayActive) startBarReplay();
+  const speed = parseInt(document.getElementById('replay_speed').value || '400', 10);
+  btn.classList.add('active');
+  btn.textContent = '⏸ Pause';
+  replayTimer = setInterval(() => {
+    if (!currentData || replayIndex >= currentData.candles.length - 1) {
+      toggleReplayAutoPlay();
+      return;
+    }
+    stepReplay(1);
+  }, speed);
+}
+
+function stopBarReplay() {
+  if (replayTimer) toggleReplayAutoPlay();
+  replayActive = false;
+  document.getElementById('btn-replay-start').classList.remove('active');
+  document.getElementById('replay-status-text').textContent = '[Full History Mode]';
+  if (!currentData) return;
+  replayIndex = currentData.candles.length - 1;
+  renderReplayFrame(true);
+}
+
+function clearManualReplayHistory() {
+  manualReplayOrders = [];
+  manualSimResult = null;
+  document.getElementById('btn-close-manual').style.display = 'none';
+  if (replayActive) {
+    renderReplayFrame(false);
+  } else if (currentData) {
+    candleSeries.setMarkers(currentData.backtest.markers || []);
+    renderOverlays();
+    updateTradeLogTable(currentData);
   }
 }
 
-function renderSlicedChart() {
-  if (!currentData) return;
-  const sliceEnd = replayIdx + 1;
-  candleSeries.setData(currentData.candles.slice(0, sliceEnd));
-  volumeSeries.setData(currentData.volumes.slice(0, sliceEnd));
-  
-  Object.keys(lineSeriesMap).forEach(k => {
-    if (currentData.series[k] && document.getElementById('chk_' + k.replace(/_u2|_l2|_lower|_upper/, '_bands').replace(/ema50/, 'ema20')).checked) {
-       lineSeriesMap[k].setData(currentData.series[k].slice(0, sliceEnd));
+function executeManualReplayOrder(side) {
+  if (!currentData || !currentData.candles || currentData.candles.length === 0) return;
+  if (!replayActive) {
+    // If user clicks Buy/Short without starting replay first, start replay at current last bar or 75% bar
+    startBarReplay(Math.max(1, currentData.candles.length - 20));
+  }
+  // Check if there is already an open manual position at replayIndex
+  recomputeManualReplaySim();
+  if (manualSimResult && manualSimResult.hasOpenPosition) {
+    // If an opposite-side position is open, close it at current bar first, then open new one
+    const lastOrd = manualReplayOrders[manualReplayOrders.length - 1];
+    if (lastOrd && lastOrd.forceCloseIdx === null) {
+      lastOrd.forceCloseIdx = replayIndex;
     }
+  }
+  const allocPct = Math.max(1, Math.min(100, parseFloat(document.getElementById('top_alloc_pct').value) || 25));
+  manualReplayOrders.push({
+    entryIdx: replayIndex,
+    side: side,
+    allocPct: allocPct,
+    forceCloseIdx: null
   });
-
-  const curTs = currentData.candles[replayIdx].time;
-  let markers = currentData.backtest.markers || [];
-  candleSeries.setMarkers(markers.filter(m => m.time <= curTs));
-  
-  chart.timeScale().scrollToPosition(0, true); // Keep chart focused on latest replay bar
+  renderReplayFrame(false);
 }
 
+function closeManualReplayPosition() {
+  if (!replayActive || manualReplayOrders.length === 0) return;
+  const lastOrd = manualReplayOrders[manualReplayOrders.length - 1];
+  if (lastOrd && lastOrd.forceCloseIdx === null && replayIndex > lastOrd.entryIdx) {
+    lastOrd.forceCloseIdx = replayIndex;
+    renderReplayFrame(false);
+  }
+}
+
+/**
+ * Simulates all user manual replay trades up to `maxBarIdx` (1-by-1 candlestick progression)
+ * with exact Portfolio % sizing, Dynamic SL/TP, and Multi-Tranche Scale-Out Ladder.
+ */
+function recomputeManualReplaySim() {
+  if (!currentData || manualReplayOrders.length === 0) {
+    manualSimResult = null;
+    document.getElementById('btn-close-manual').style.display = 'none';
+    return;
+  }
+  const maxIdx = replayActive ? replayIndex : (currentData.candles.length - 1);
+  const candles = currentData.candles;
+  const initCap = parseFloat(document.getElementById('initial_capital').value) || 100000;
+  const enableLadder = document.getElementById('enable_scale_out').checked;
+  const t1GainPct = parseFloat(document.getElementById('t1_gain_pct').value) || 4.0;
+  const t1SellPct = parseFloat(document.getElementById('t1_sell_pct').value) || 35.0;
+  const t2GainPct = parseFloat(document.getElementById('t2_gain_pct').value) || 8.0;
+  const t2SellPct = parseFloat(document.getElementById('t2_sell_pct').value) || 35.0;
+
+  let cash = initCap;
+  let trades = [];
+  let markers = [];
+  let boxes = [];
+  let hasOpenPos = false;
+
+  for (let oIdx = 0; oIdx < manualReplayOrders.length; oIdx++) {
+    const ord = manualReplayOrders[oIdx];
+    if (ord.entryIdx > maxIdx) continue;
+
+    const entryCandle = candles[ord.entryIdx];
+    const bInfo = currentData.bar_details[String(entryCandle.time)] || {};
+    const ep = entryCandle.close;
+    const isLong = (ord.side === 'LONG');
+    const unitVol = bInfo.unit_vol || bInfo.atr || (ep * 0.015);
+    const dSl = bInfo.dyn_sl_mult || parseFloat(document.getElementById('sl_mult').value) || 1.5;
+    const dTp = bInfo.dyn_tp_mult || parseFloat(document.getElementById('tp_mult').value) || 2.8;
+
+    let slPrice = isLong ? (ep - dSl * unitVol) : (ep + dSl * unitVol);
+    const initSlPrice = slPrice;
+    const tpPrice = isLong ? (ep + dTp * unitVol) : (ep - dTp * unitVol);
+
+    const fullDist = Math.abs(tpPrice - ep);
+    const pctDist1 = ep * (Math.max(t1GainPct, 0.1) / 100.0);
+    const pctDist2 = ep * (Math.max(t2GainPct, 0.2) / 100.0);
+    const d1 = Math.max(Math.min(pctDist1, fullDist * 0.5), ep * 0.002);
+    const d2 = Math.max(Math.min(pctDist2, fullDist * 0.8), d1 * 1.35);
+    const t1Target = isLong ? (ep + d1) : (ep - d1);
+    const t2Target = isLong ? (ep + d2) : (ep - d2);
+
+    const targetDollars = cash * (ord.allocPct / 100.0);
+    const initShares = Math.max(1, Math.floor(targetDollars / Math.max(ep, 0.01)));
+    let remShares = initShares;
+    const posVal = initShares * ep;
+    const dollarRisk = initShares * Math.abs(ep - initSlPrice);
+
+    let realizedPnl = 0.0;
+    let scaleStage = 0;
+    let scaleNotes = [];
+    let closed = false;
+    let exitBarIdx = maxIdx;
+    let exitPrice = candles[maxIdx].close;
+    let resType = 'OPEN';
+
+    markers.push({
+      time: entryCandle.time,
+      position: isLong ? 'belowBar' : 'aboveBar',
+      color: isLong ? '#00E676' : '#FF4081',
+      shape: isLong ? 'arrowUp' : 'arrowDown',
+      text: `MANUAL ${ord.side} ${initShares}sh (${ord.allocPct}% Eq @ $${ep.toFixed(2)})`
+    });
+
+    for (let j = ord.entryIdx + 1; j <= maxIdx; j++) {
+      const c = candles[j];
+      if (ord.forceCloseIdx !== null && j >= ord.forceCloseIdx) {
+        exitPrice = c.close;
+        const remPnl = (isLong ? (exitPrice - ep) : (ep - exitPrice)) * remShares;
+        realizedPnl += remPnl;
+        remShares = 0;
+        closed = true;
+        exitBarIdx = j;
+        resType = realizedPnl >= 0 ? 'MANUAL-WIN' : 'MANUAL-EXIT';
+        markers.push({
+          time: c.time,
+          position: isLong ? 'aboveBar' : 'belowBar',
+          color: '#FFD600',
+          shape: isLong ? 'arrowDown' : 'arrowUp',
+          text: `MANUAL CLOSE (${realizedPnl >= 0 ? '+' : ''}$${Math.round(realizedPnl).toLocaleString()})`
+        });
+        break;
+      }
+
+      const hitSlFirst = isLong ? (c.low <= slPrice) : (c.high >= slPrice);
+      if (enableLadder && !hitSlFirst && remShares >= 3) {
+        if (scaleStage === 0 && (isLong ? (c.high >= t1Target && t1Target < tpPrice) : (c.low <= t1Target && t1Target > tpPrice))) {
+          const qty1 = Math.min(remShares - 1, Math.max(1, Math.round(initShares * (t1SellPct / 100.0))));
+          const p1 = (isLong ? (t1Target - ep) : (ep - t1Target)) * qty1;
+          realizedPnl += p1;
+          remShares -= qty1;
+          scaleStage = 1;
+          slPrice = isLong ? Math.max(slPrice, ep) : Math.min(slPrice, ep);
+          scaleNotes.push(`T1(-${qty1}sh@$${t1Target.toFixed(2)})`);
+          markers.push({
+            time: c.time,
+            position: isLong ? 'aboveBar' : 'belowBar',
+            color: '#80D8FF',
+            shape: 'circle',
+            text: `T1 ${isLong ? 'SELL' : 'COVER'} ${qty1}sh (+$${Math.round(p1)})`
+          });
+        }
+        if (scaleStage === 1 && remShares >= 2 && (isLong ? (c.high >= t2Target && t2Target < tpPrice) : (c.low <= t2Target && t2Target > tpPrice))) {
+          const qty2 = Math.min(remShares - 1, Math.max(1, Math.round(initShares * (t2SellPct / 100.0))));
+          const p2 = (isLong ? (t2Target - ep) : (ep - t2Target)) * qty2;
+          realizedPnl += p2;
+          remShares -= qty2;
+          scaleStage = 2;
+          slPrice = isLong ? Math.max(slPrice, t1Target) : Math.min(slPrice, t1Target);
+          scaleNotes.push(`T2(-${qty2}sh@$${t2Target.toFixed(2)})`);
+          markers.push({
+            time: c.time,
+            position: isLong ? 'aboveBar' : 'belowBar',
+            color: '#40C4FF',
+            shape: 'circle',
+            text: `T2 ${isLong ? 'SELL' : 'COVER'} ${qty2}sh (+$${Math.round(p2)})`
+          });
+        }
+      }
+
+      const hitTp = isLong ? (c.high >= tpPrice) : (c.low <= tpPrice);
+      const hitSl = isLong ? (c.low <= slPrice) : (c.high >= slPrice);
+      if (hitTp || hitSl) {
+        exitPrice = hitTp ? tpPrice : slPrice;
+        const remPnl = (isLong ? (exitPrice - ep) : (ep - exitPrice)) * remShares;
+        realizedPnl += remPnl;
+        remShares = 0;
+        closed = true;
+        exitBarIdx = j;
+        resType = hitTp ? 'TP' : (realizedPnl > 0 ? 'TRAIL-WIN' : 'SL');
+        markers.push({
+          time: c.time,
+          position: isLong ? 'aboveBar' : 'belowBar',
+          color: (hitTp || realizedPnl > 0) ? '#FFD600' : '#FF1744',
+          shape: isLong ? 'arrowDown' : 'arrowUp',
+          text: `${isLong ? 'L' : 'S'}-${resType} (${realizedPnl >= 0 ? '+' : ''}$${Math.round(realizedPnl).toLocaleString()})`
+        });
+        break;
+      }
+    }
+
+    let totalTradePnl = realizedPnl;
+    if (!closed) {
+      hasOpenPos = true;
+      exitPrice = candles[maxIdx].close;
+      const unreal = (isLong ? (exitPrice - ep) : (ep - exitPrice)) * remShares;
+      totalTradePnl += unreal;
+    } else {
+      cash += totalTradePnl;
+    }
+
+    const eqAfter = closed ? cash : (cash + totalTradePnl);
+    const retPct = (totalTradePnl / Math.max(posVal, 1)) * 100.0;
+    const exitCandle = candles[exitBarIdx];
+    const exitInfo = currentData.bar_details[String(exitCandle.time)] || {};
+
+    trades.push({
+      trade_no: 100 + oIdx + 1,
+      side: ord.side,
+      signal_type: `MANUAL REPLAY (${ord.allocPct}% Eq)`,
+      pool: `Manual (${ord.allocPct}% Portfolio)`,
+      entry_bar_idx: ord.entryIdx,
+      exit_bar_idx: exitBarIdx,
+      entry_time: entryCandle.time,
+      entry_dt: bInfo.dt || String(entryCandle.time),
+      exit_time: exitCandle.time,
+      exit_dt: closed ? (exitInfo.dt || String(exitCandle.time)) : 'OPEN (Replay Active)',
+      type: resType,
+      entry_price: Number(ep.toFixed(2)),
+      exit_price: Number(exitPrice.toFixed(2)),
+      sl_price: Number(initSlPrice.toFixed(2)),
+      tp_price: Number(tpPrice.toFixed(2)),
+      dyn_mults: `${dSl.toFixed(2)}x / ${dTp.toFixed(2)}x`,
+      scale_summary: scaleNotes.length > 0 ? scaleNotes.join(' -> ') : (closed ? '100% @ Exit' : `OPEN (${remShares}sh)`),
+      shares: initShares,
+      position_value: Number(posVal.toFixed(2)),
+      alloc_pct: Number(ord.allocPct.toFixed(1)),
+      dollar_risk: Number(dollarRisk.toFixed(2)),
+      bar_volume: bInfo.vol || 0,
+      bar_rvol: bInfo.rvol || 1.0,
+      pnl: Number(totalTradePnl.toFixed(2)),
+      ret_pct: Number(retPct.toFixed(2)),
+      equity_after: Number(eqAfter.toFixed(2))
+    });
+
+    boxes.push({
+      trade_no: 100 + oIdx + 1,
+      side: ord.side,
+      t1: entryCandle.time,
+      t2: exitCandle.time,
+      entry: Number(ep.toFixed(2)),
+      tp: Number(tpPrice.toFixed(2)),
+      sl: Number(initSlPrice.toFixed(2)),
+      t1_lvl: Number(t1Target.toFixed(2)),
+      t2_lvl: Number(t2Target.toFixed(2)),
+      outcome: closed ? resType : 'ACTIVE'
+    });
+  }
+
+  document.getElementById('btn-close-manual').style.display = hasOpenPos ? 'inline-block' : 'none';
+  const latestEq = trades.length > 0 ? trades[trades.length - 1].equity_after : initCap;
+  manualSimResult = {
+    trades,
+    markers,
+    boxes,
+    hasOpenPosition: hasOpenPos,
+    endingEquity: latestEq,
+    netReturnPct: Number((((latestEq - initCap) / initCap) * 100).toFixed(2))
+  };
+}
+
+function renderReplayFrame(resetViewport = false) {
+  if (!currentData || !currentData.candles || currentData.candles.length === 0) return;
+  const maxIdx = replayActive ? replayIndex : (currentData.candles.length - 1);
+  const cutoffTime = currentData.candles[maxIdx].time;
+
+  const visCandles = currentData.candles.slice(0, maxIdx + 1);
+  const visVolumes = currentData.volumes.slice(0, maxIdx + 1);
+  candleSeries.setData(visCandles);
+  volumeSeries.setData(visVolumes);
+
+  recomputeManualReplaySim();
+
+  // Combine strategy markers up to cutoffTime + manual replay markers
+  const stratMarkers = (currentData.backtest.markers || []).filter(m => m.time <= cutoffTime);
+  const manMarkers = manualSimResult ? manualSimResult.markers : [];
+  const combinedMarkers = [...stratMarkers, ...manMarkers].sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(combinedMarkers);
+
+  const curBarInfo = currentData.bar_details[String(cutoffTime)] || {};
+  const statusEl = document.getElementById('replay-status-text');
+  if (replayActive) {
+    const eqStr = manualSimResult ? ` | Manual Replay Equity: $${manualSimResult.endingEquity.toLocaleString()} (${manualSimResult.netReturnPct >= 0 ? '+' : ''}${manualSimResult.netReturnPct}%)` : '';
+    statusEl.textContent = `Bar ${maxIdx + 1} / ${currentData.candles.length} — ${curBarInfo.dt || ''} | Close: $${curBarInfo.c || ''}${eqStr}`;
+  } else {
+    statusEl.textContent = '[Full History Mode]';
+  }
+
+  renderOverlays();
+  updateTradeLogTable(currentData);
+
+  if (resetViewport) {
+    chart.timeScale().fitContent();
+  }
+}
+
+/**
+ * SMART LOGICAL-BAR TRADE ZOOM
+ */
 function focusTradeOnChart(t, rowEl) {
   if (!chart || !currentData) return;
   focusedTradeNo = t.trade_no;
+
   document.querySelectorAll('#trade-log-table tbody tr').forEach(r => r.classList.remove('selected-trade-row'));
   if (rowEl) rowEl.classList.add('selected-trade-row');
 
   const eIdx = (typeof t.entry_bar_idx === 'number') ? t.entry_bar_idx : 0;
   const xIdx = (typeof t.exit_bar_idx === 'number') ? t.exit_bar_idx : eIdx + 1;
-  const padBars = Math.max(18, Math.round((xIdx - eIdx) * 1.35));
+  const spanBars = Math.max(1, xIdx - eIdx);
+  const padBars = Math.max(18, Math.round(spanBars * 1.35));
+
+  const fromLogical = Math.max(-5, eIdx - padBars);
+  const toLogical = Math.min(currentData.total_bars + 5, xIdx + padBars);
+
   chart.priceScale('right').applyOptions({ autoScale: true });
-  chart.timeScale().setVisibleLogicalRange({ from: Math.max(-5, eIdx - padBars), to: Math.min(currentData.total_bars + 5, xIdx + padBars) });
+  chart.timeScale().setVisibleLogicalRange({ from: fromLogical, to: toLogical });
+
+  const boxChk = document.getElementById('chk_tpsl_boxes');
+  if (boxChk && !boxChk.checked) {
+    boxChk.checked = true;
+  }
   requestAnimationFrame(drawCanvasZones);
 }
 
@@ -2287,145 +3287,230 @@ function renderBreadcrumbs() {
   breadcrumbs.forEach((b, idx) => {
     const el = document.createElement('span');
     el.className = 'crumb' + (idx === activeCrumbIdx ? ' active' : '');
-    const lbl = document.createElement('span'); lbl.textContent = b.label;
-    lbl.onclick = () => { activeCrumbIdx = idx; currentTF = b.tf; currentStartTs = b.startTs; loadChartData(); };
+
+    const lbl = document.createElement('span');
+    lbl.textContent = b.label;
+    lbl.onclick = () => {
+      activeCrumbIdx = idx;
+      currentTF = b.tf;
+      currentStartTs = b.startTs;
+      loadChartData();
+    };
     el.appendChild(lbl);
-    const closeBtn = document.createElement('span'); closeBtn.className = 'crumb-close'; closeBtn.textContent = '×';
-    closeBtn.onclick = (e) => { e.stopPropagation(); deleteCrumb(idx); };
+
+    const closeBtn = document.createElement('span');
+    closeBtn.className = 'crumb-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Delete this navigation tab';
+    closeBtn.onclick = (e) => {
+      e.stopPropagation();
+      deleteCrumb(idx);
+    };
     el.appendChild(closeBtn);
     bar.appendChild(el);
   });
+
   if (breadcrumbs.length > 1) {
-    const clearBtn = document.createElement('button'); clearBtn.className = 'crumb-clear'; clearBtn.textContent = 'Clear All';
-    clearBtn.onclick = resetToRoot; bar.appendChild(clearBtn);
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'crumb-clear';
+    clearBtn.textContent = 'Clear All';
+    clearBtn.onclick = resetToRoot;
+    bar.appendChild(clearBtn);
   }
-  document.querySelectorAll('.tf-btn').forEach(btn => btn.classList.toggle('active', btn.textContent.toLowerCase().includes(currentTF.toLowerCase())));
+
+  document.querySelectorAll('.tf-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.textContent.toLowerCase() === currentTF.toLowerCase());
+  });
 }
 
 function deleteCrumb(idx) {
-  if (breadcrumbs.length <= 1) { resetToRoot(); return; }
+  if (breadcrumbs.length <= 1) {
+    resetToRoot();
+    return;
+  }
   breadcrumbs.splice(idx, 1);
-  if (activeCrumbIdx >= breadcrumbs.length) activeCrumbIdx = breadcrumbs.length - 1;
+  if (activeCrumbIdx >= breadcrumbs.length) {
+    activeCrumbIdx = breadcrumbs.length - 1;
+  }
   const activeTab = breadcrumbs[activeCrumbIdx];
-  currentTF = activeTab.tf; currentStartTs = activeTab.startTs;
+  currentTF = activeTab.tf;
+  currentStartTs = activeTab.startTs;
   loadChartData();
 }
 
 function switchTF(tf) {
   currentTF = tf;
-  if (activeCrumbIdx === 0) currentStartTs = null;
-  manualTrades = []; // clear manual trades on tf switch
+  if (activeCrumbIdx === 0) {
+    currentStartTs = null;
+  }
   const datePrefix = currentStartTs ? new Date(currentStartTs * 1000).toISOString().slice(0, 10) : 'Max';
   breadcrumbs[activeCrumbIdx] = { label: `${datePrefix} (${tf})`, tf: tf, startTs: currentStartTs };
-  startPolling();
   loadChartData();
 }
 
 function resetToRoot() {
-  currentTF = '1Y'; currentStartTs = null; currentCutoffTs = null; manualEntryTs = null; focusedTradeNo = null; manualTrades = [];
-  breadcrumbs = [{ label: `Max (1Y)`, tf: '1Y', startTs: null }]; activeCrumbIdx = 0;
+  if (replayTimer) toggleReplayAutoPlay();
+  replayActive = false;
+  manualReplayOrders = [];
+  manualSimResult = null;
+  currentTF = '1Y';
+  currentStartTs = null;
+  currentCutoffTs = null;
+  manualEntryTs = null;
+  focusedTradeNo = null;
+  breadcrumbs = [{ label: `Max (1Y)`, tf: '1Y', startTs: null }];
+  activeCrumbIdx = 0;
   loadChartData();
 }
 
-function clearCutoffAndManual() { currentCutoffTs = null; manualEntryTs = null; focusedTradeNo = null; loadChartData(); }
-function onStrategyChange() { loadChartData(); }
-
-async function loadChartData(silent = false) {
-  if (!silent) renderBreadcrumbs();
+function clearCutoffAndManual() {
+  if (replayTimer) toggleReplayAutoPlay();
+  replayActive = false;
+  manualReplayOrders = [];
+  manualSimResult = null;
+  currentCutoffTs = null;
+  manualEntryTs = null;
   focusedTradeNo = null;
+  loadChartData();
+}
+
+function onStrategyChange() {
+  loadChartData();
+}
+
+async function loadChartData(isBackgroundRefresh = false) {
+  renderBreadcrumbs();
+  if (!isBackgroundRefresh) focusedTradeNo = null;
+
   const params = new URLSearchParams({
-    ticker: document.getElementById('ticker').value, tf: currentTF,
-    strategy: document.getElementById('strategy').value, trade_side: document.getElementById('trade_side').value,
-    sl_mult: document.getElementById('sl_mult').value, tp_mult: document.getElementById('tp_mult').value,
-    dynamic_tpsl: document.getElementById('dynamic_tpsl').value, vol_model: document.getElementById('vol_model').value,
-    ema200_filter: document.getElementById('chk_ema200_filter').checked ? 'true' : 'false',
+    ticker: document.getElementById('ticker').value,
+    tf: currentTF,
+    strategy: document.getElementById('strategy').value,
+    trade_side: document.getElementById('trade_side').value,
+    ema200_filter: document.getElementById('ema200_filter').value,
+    sl_mult: document.getElementById('sl_mult').value,
+    tp_mult: document.getElementById('tp_mult').value,
+    dynamic_tpsl: document.getElementById('dynamic_tpsl').value,
+    vol_model: document.getElementById('vol_model').value,
     enable_scale_out: document.getElementById('enable_scale_out').checked ? 'true' : 'false',
-    t1_gain_pct: document.getElementById('t1_gain_pct').value, t1_sell_pct: document.getElementById('t1_sell_pct').value,
-    t2_gain_pct: document.getElementById('t2_gain_pct').value, t2_sell_pct: document.getElementById('t2_sell_pct').value,
-    w_trend: document.getElementById('w_trend').value, w_liq: document.getElementById('w_liq').value, w_rev: document.getElementById('w_rev').value,
-    initial_capital: document.getElementById('initial_capital').value, core_pct: document.getElementById('core_pct').value,
-    intraday_pct: document.getElementById('intraday_pct').value, risk_pct: document.getElementById('risk_pct').value
+    t1_gain_pct: document.getElementById('t1_gain_pct').value,
+    t1_sell_pct: document.getElementById('t1_sell_pct').value,
+    t2_gain_pct: document.getElementById('t2_gain_pct').value,
+    t2_sell_pct: document.getElementById('t2_sell_pct').value,
+    w_trend: document.getElementById('w_trend').value,
+    w_liq: document.getElementById('w_liq').value,
+    w_rev: document.getElementById('w_rev').value,
+    initial_capital: document.getElementById('initial_capital').value,
+    core_pct: document.getElementById('core_pct').value,
+    intraday_pct: document.getElementById('intraday_pct').value,
+    risk_pct: document.getElementById('risk_pct').value,
+    manual_side: manualSide,
+    manual_alloc_pct: document.getElementById('manual_alloc_pct').value,
+    force_refresh: isBackgroundRefresh ? 'true' : 'false'
   });
   if (currentStartTs) params.append('start_ts', currentStartTs);
   if (currentCutoffTs) params.append('cutoff_ts', currentCutoffTs);
-  if (isReplay && manualTrades.length > 0) params.append('manual_trades_json', JSON.stringify(manualTrades));
-
-  let range = silent && chart ? chart.timeScale().getVisibleLogicalRange() : null;
+  if (manualEntryTs) params.append('manual_entry_ts', manualEntryTs);
 
   const res = await fetch(`/api/analyze?${params.toString()}`);
   const data = await res.json();
   const banner = document.getElementById('alert-banner');
-  if (data.error) { banner.style.display = 'block'; banner.textContent = data.error; return; }
-  
+
+  if (data.error) {
+    banner.style.display = 'block';
+    banner.textContent = data.error;
+    return;
+  }
+
   currentData = data;
   let msgs = [];
   if (data.warning) msgs.push(data.warning);
-  if (data.unavailable_indicators && data.unavailable_indicators.length > 0) msgs.push("Note: " + data.unavailable_indicators.join(", "));
-  if (msgs.length > 0) { banner.style.display = 'block'; banner.textContent = msgs.join(" | "); } else banner.style.display = 'none';
-
-  const allIndIds = ['ema20', 'ema200', 'vwap', 'vwap_bands', 'atr_bands', 'gk_bands', 'fib_levels', 'orb_levels', 'fvg_zones'];
-  allIndIds.forEach(id => { const el = document.getElementById('chk_' + id); if (el) el.checked = data.auto_indicators.includes(id); });
-
-  if (isReplay) {
-    if (!silent) renderSlicedChart(); 
-  } else {
-    candleSeries.setData(data.candles);
-    volumeSeries.setData(data.volumes);
-    candleSeries.setMarkers(data.backtest.markers || []);
-    if (!silent) {
-        if (range) chart.timeScale().setVisibleLogicalRange(range);
-        else chart.timeScale().fitContent();
-    }
-    renderOverlays();
+  if (data.unavailable_indicators && data.unavailable_indicators.length > 0) {
+    msgs.push("Note: " + data.unavailable_indicators.join(", "));
   }
-  
-  updateTradeLogTable(data);
+  if (msgs.length > 0) {
+    banner.style.display = 'block';
+    banner.textContent = msgs.join(" | ");
+  } else {
+    banner.style.display = 'none';
+  }
+
+  if (!isBackgroundRefresh) {
+    const allIndIds = ['ema20', 'ema200', 'vwap', 'vwap_bands', 'atr_bands', 'gk_bands', 'fib_levels', 'orb_levels', 'fvg_zones'];
+    allIndIds.forEach(id => {
+      const el = document.getElementById('chk_' + id);
+      if (el) el.checked = data.auto_indicators.includes(id);
+    });
+  }
+
+  if (!replayActive) {
+    replayIndex = Math.max(0, data.candles.length - 1);
+  } else {
+    replayIndex = Math.min(replayIndex, Math.max(0, data.candles.length - 1));
+  }
+
+  renderReplayFrame(!isBackgroundRefresh);
   updateSummaryTable(data);
 
   document.getElementById('opt_spot').value = data.latest_metrics.close;
-  document.getElementById('opt_strike').value = Math.round(data.latest_metrics.close * 1.05);
-  document.getElementById('opt_gk').value = data.latest_metrics.gk_daily_vol_pct;
-  if (!silent) {
-      calcOptions();
-      loadOptionChain();
+  if (!isBackgroundRefresh) {
+    document.getElementById('opt_strike').value = Math.round(data.latest_metrics.close * 1.05);
   }
+  document.getElementById('opt_gk').value = data.latest_metrics.gk_daily_vol_pct;
+  calcOptions();
+  loadOptionChain(document.getElementById('chain_expiry').value || '');
+
+  setTimeout(resizeChart, 50);
 }
 
 function renderOverlays() {
-  if (!currentData || isReplay) return;
+  if (!currentData) return;
   const s = currentData.series;
+  const maxIdx = replayActive ? replayIndex : (currentData.candles.length - 1);
+  const cutoffTime = currentData.candles[maxIdx] ? currentData.candles[maxIdx].time : Infinity;
+  const sliceToReplay = (arr) => (arr || []).filter(pt => pt.time <= cutoffTime);
 
   const showEma = document.getElementById('chk_ema20').checked;
-  lineSeriesMap.ema20.setData(showEma ? s.ema20 : []);
-  lineSeriesMap.ema50.setData(showEma ? s.ema50 : []);
-  lineSeriesMap.ema200.setData(document.getElementById('chk_ema200').checked ? s.ema200 : []);
+  lineSeriesMap.ema20.setData(showEma ? sliceToReplay(s.ema20) : []);
+  lineSeriesMap.ema50.setData(showEma ? sliceToReplay(s.ema50) : []);
+
+  const showEma200 = document.getElementById('chk_ema200').checked;
+  lineSeriesMap.ema200.setData(showEma200 ? sliceToReplay(s.ema200) : []);
 
   const showVwap = document.getElementById('chk_vwap').checked;
-  lineSeriesMap.vwap.setData(showVwap ? s.vwap : []);
+  lineSeriesMap.vwap.setData(showVwap ? sliceToReplay(s.vwap) : []);
 
   const showVwapBands = document.getElementById('chk_vwap_bands').checked;
-  lineSeriesMap.vwap_u2.setData(showVwapBands ? s.vwap_u2 : []); lineSeriesMap.vwap_l2.setData(showVwapBands ? s.vwap_l2 : []);
+  lineSeriesMap.vwap_u2.setData(showVwapBands ? sliceToReplay(s.vwap_u2) : []);
+  lineSeriesMap.vwap_l2.setData(showVwapBands ? sliceToReplay(s.vwap_l2) : []);
 
   const showAtr = document.getElementById('chk_atr_bands').checked;
-  lineSeriesMap.atr_upper.setData(showAtr ? s.atr_upper : []); lineSeriesMap.atr_lower.setData(showAtr ? s.atr_lower : []);
+  lineSeriesMap.atr_upper.setData(showAtr ? sliceToReplay(s.atr_upper) : []);
+  lineSeriesMap.atr_lower.setData(showAtr ? sliceToReplay(s.atr_lower) : []);
 
   const showGk = document.getElementById('chk_gk_bands').checked;
-  lineSeriesMap.gk_upper.setData(showGk ? s.gk_upper : []); lineSeriesMap.gk_lower.setData(showGk ? s.gk_lower : []);
+  lineSeriesMap.gk_upper.setData(showGk ? sliceToReplay(s.gk_upper) : []);
+  lineSeriesMap.gk_lower.setData(showGk ? sliceToReplay(s.gk_lower) : []);
 
   const showFib = document.getElementById('chk_fib_levels').checked;
-  lineSeriesMap.fib_382.setData(showFib ? s.fib_382 : []); lineSeriesMap.fib_500.setData(showFib ? s.fib_500 : []);
-  lineSeriesMap.fib_618.setData(showFib ? s.fib_618 : []); lineSeriesMap.fib_786.setData(showFib ? s.fib_786 : []);
+  lineSeriesMap.fib_382.setData(showFib ? sliceToReplay(s.fib_382) : []);
+  lineSeriesMap.fib_500.setData(showFib ? sliceToReplay(s.fib_500) : []);
+  lineSeriesMap.fib_618.setData(showFib ? sliceToReplay(s.fib_618) : []);
+  lineSeriesMap.fib_786.setData(showFib ? sliceToReplay(s.fib_786) : []);
 
   const showOrb = document.getElementById('chk_orb_levels').checked;
-  lineSeriesMap.orb_high.setData(showOrb ? s.orb_high : []); lineSeriesMap.orb_low.setData(showOrb ? s.orb_low : []);
+  lineSeriesMap.orb_high.setData(showOrb ? sliceToReplay(s.orb_high) : []);
+  lineSeriesMap.orb_low.setData(showOrb ? sliceToReplay(s.orb_low) : []);
 
-  const st = currentData.backtest.stats; const lm = currentData.latest_metrics;
+  const st = currentData.backtest.stats;
+  const lm = currentData.latest_metrics;
+  const filterMode = document.getElementById('ema200_filter').selectedOptions[0].text;
   document.getElementById('chart-legend').innerHTML = `
-    <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${currentData.total_bars} bars)
-    | Close: $${lm.close} | ATR: $${lm.atr} | GK Vol: ${lm.gk_daily_vol_pct}% | <span style="color:#00e5ff">Dyn Mults: ${lm.dyn_sl_mult}x SL / ${lm.dyn_tp_mult}x TP</span><br>
-    <span style="color:#00e676">Total Portfolio Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span>
-    | Core Pool Cash: $${st.core_cash_end.toLocaleString()} | Intraday Pool Cash: $${st.intraday_cash_end.toLocaleString()}
-    | Trades: ${st.total_trades} (${st.long_trades}L/${st.short_trades}S) | Win Rate: ${st.win_rate_pct}%
+    <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${maxIdx + 1}/${currentData.total_bars} bars | Server: ${currentData.server_updated_at})<br>
+    Close: <b>$${lm.close}</b> | <span style="color:#ffd600">EMA 200: $${lm.ema200}</span> | ATR: $${lm.atr} | GK Vol: ${lm.gk_daily_vol_pct}% | <span style="color:#00e5ff">Filter: ${filterMode}</span><br>
+    <span style="color:#00e676">Strategy Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span> |
+    Core Cash: $${st.core_cash_end.toLocaleString()} | Intraday Cash: $${st.intraday_cash_end.toLocaleString()} |
+    Trades: ${st.total_trades} (${st.long_trades}L/${st.short_trades}S) | Win Rate: ${st.win_rate_pct}%
   `;
   requestAnimationFrame(drawCanvasZones);
 }
@@ -2433,64 +3518,101 @@ function renderOverlays() {
 function drawCanvasZones() {
   const canvas = document.getElementById('overlay-canvas');
   const wrap = document.getElementById('chart-wrap');
-  canvas.width = wrap.clientWidth; canvas.height = wrap.clientHeight;
-  const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!currentData || isReplay) return;
+  canvas.width = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!currentData) return;
   const tsScale = chart.timeScale();
+  const maxIdx = replayActive ? replayIndex : (currentData.candles.length - 1);
+  const cutoffTime = currentData.candles[maxIdx] ? currentData.candles[maxIdx].time : Infinity;
 
   if (document.getElementById('chk_unclear').checked && currentData.unclear_spans) {
-    ctx.fillStyle = 'rgba(120, 123, 134, 0.14)'; ctx.font = '10px sans-serif';
+    ctx.fillStyle = 'rgba(120, 123, 134, 0.14)';
+    ctx.font = '10px sans-serif';
     currentData.unclear_spans.forEach(span => {
-      const x1 = tsScale.timeToCoordinate(span.t1), x2 = tsScale.timeToCoordinate(span.t2);
+      if (span.t1 > cutoffTime) return;
+      const x1 = tsScale.timeToCoordinate(span.t1);
+      const x2 = tsScale.timeToCoordinate(Math.min(span.t2, cutoffTime));
       if (x1 !== null && x2 !== null && (x2 - x1) > 12) {
         ctx.fillRect(x1, 0, x2 - x1, canvas.height - 28);
-        ctx.fillStyle = 'rgba(180, 185, 195, 0.55)'; ctx.fillText('VOLATILE / UNCLEAR', x1 + 4, 24); ctx.fillStyle = 'rgba(120, 123, 134, 0.14)';
+        ctx.fillStyle = 'rgba(180, 185, 195, 0.55)';
+        ctx.fillText('VOLATILE / UNCLEAR', x1 + 4, 24);
+        ctx.fillStyle = 'rgba(120, 123, 134, 0.14)';
       }
     });
   }
 
   if (document.getElementById('chk_fvg_zones').checked && currentData.fvg_boxes) {
     currentData.fvg_boxes.forEach(b => {
-      const x1 = tsScale.timeToCoordinate(b.t1), x2 = tsScale.timeToCoordinate(b.t2);
-      const yTop = candleSeries.priceToCoordinate(b.top), yBot = candleSeries.priceToCoordinate(b.bot);
+      if (b.t1 > cutoffTime) return;
+      const x1 = tsScale.timeToCoordinate(b.t1);
+      const x2 = tsScale.timeToCoordinate(Math.min(b.t2, cutoffTime));
+      const yTop = candleSeries.priceToCoordinate(b.top);
+      const yBot = candleSeries.priceToCoordinate(b.bot);
       if (x1 === null || x2 === null || yTop === null || yBot === null) return;
-      const w = Math.max(x2 - x1, 8), h = Math.abs(yBot - yTop);
+      const w = Math.max(x2 - x1, 8);
+      const h = Math.abs(yBot - yTop);
       ctx.fillStyle = b.kind === 'BULL_FVG' ? 'rgba(0, 176, 255, 0.18)' : 'rgba(255, 152, 0, 0.18)';
       ctx.strokeStyle = b.kind === 'BULL_FVG' ? 'rgba(0, 176, 255, 0.6)' : 'rgba(255, 152, 0, 0.6)';
-      ctx.fillRect(x1, Math.min(yTop, yBot), w, Math.max(h, 2)); ctx.strokeRect(x1, Math.min(yTop, yBot), w, Math.max(h, 2));
+      ctx.fillRect(x1, Math.min(yTop, yBot), w, Math.max(h, 2));
+      ctx.strokeRect(x1, Math.min(yTop, yBot), w, Math.max(h, 2));
     });
   }
 
-  if (document.getElementById('chk_tpsl_boxes').checked && currentData.backtest.boxes) {
-    currentData.backtest.boxes.forEach(b => {
-      const x1 = tsScale.timeToCoordinate(b.t1), x2 = tsScale.timeToCoordinate(b.t2);
-      const yEntry = candleSeries.priceToCoordinate(b.entry), yTp = candleSeries.priceToCoordinate(b.tp), ySl = candleSeries.priceToCoordinate(b.sl);
-      if (x1 === null || x2 === null || yEntry === null || yTp === null || ySl === null) return;
+  if (document.getElementById('chk_tpsl_boxes').checked) {
+    const stratBoxes = (currentData.backtest.boxes || []).filter(b => b.t1 <= cutoffTime);
+    const manBoxes = manualSimResult ? manualSimResult.boxes : [];
+    const allBoxes = [...stratBoxes, ...manBoxes];
 
+    allBoxes.forEach(b => {
+      const x1 = tsScale.timeToCoordinate(b.t1);
+      const x2 = tsScale.timeToCoordinate(Math.min(b.t2, cutoffTime));
+      const yEntry = candleSeries.priceToCoordinate(b.entry);
+      const yTp = candleSeries.priceToCoordinate(b.tp);
+      const ySl = candleSeries.priceToCoordinate(b.sl);
+      if (x1 === null || x2 === null || yEntry === null || yTp === null || ySl === null) return;
       const w = Math.max(x2 - x1, 14);
       const isFocused = (focusedTradeNo !== null && b.trade_no === focusedTradeNo);
 
       ctx.fillStyle = isFocused ? 'rgba(0, 230, 118, 0.28)' : 'rgba(0, 230, 118, 0.15)';
       ctx.strokeStyle = isFocused ? '#00e676' : 'rgba(0, 230, 118, 0.75)';
       ctx.lineWidth = isFocused ? 2 : 1;
-      ctx.fillRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp)); ctx.strokeRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
+      ctx.fillRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
+      ctx.strokeRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
 
       ctx.fillStyle = isFocused ? 'rgba(255, 23, 68, 0.28)' : 'rgba(255, 23, 68, 0.15)';
       ctx.strokeStyle = isFocused ? '#ff1744' : 'rgba(255, 23, 68, 0.75)';
-      ctx.fillRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry)); ctx.strokeRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
+      ctx.fillRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
+      ctx.strokeRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
 
       if (b.t1_lvl && b.t2_lvl) {
-        const yT1 = candleSeries.priceToCoordinate(b.t1_lvl), yT2 = candleSeries.priceToCoordinate(b.t2_lvl);
-        ctx.save(); ctx.setLineDash([2, 3]); ctx.strokeStyle = 'rgba(128, 216, 255, 0.75)'; ctx.lineWidth = 1;
-        if (yT1 !== null) { ctx.beginPath(); ctx.moveTo(x1, yT1); ctx.lineTo(x1 + w, yT1); ctx.stroke(); }
-        if (yT2 !== null) { ctx.beginPath(); ctx.moveTo(x1, yT2); ctx.lineTo(x1 + w, yT2); ctx.stroke(); }
+        const yT1 = candleSeries.priceToCoordinate(b.t1_lvl);
+        const yT2 = candleSeries.priceToCoordinate(b.t2_lvl);
+        ctx.save();
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = 'rgba(128, 216, 255, 0.75)';
+        ctx.lineWidth = 1;
+        if (yT1 !== null) {
+          ctx.beginPath(); ctx.moveTo(x1, yT1); ctx.lineTo(x1 + w, yT1); ctx.stroke();
+        }
+        if (yT2 !== null) {
+          ctx.beginPath(); ctx.moveTo(x1, yT2); ctx.lineTo(x1 + w, yT2); ctx.stroke();
+        }
         ctx.restore();
       }
 
       if (isFocused) {
-        const topY = Math.min(yTp, ySl, yEntry) - 6, botY = Math.max(yTp, ySl, yEntry) + 6;
-        ctx.save(); ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2.5; ctx.strokeRect(x1 - 4, topY, w + 8, botY - topY);
-        ctx.fillStyle = '#00e5ff'; ctx.font = 'bold 11px sans-serif'; ctx.fillText(`Trade #${b.trade_no} (${b.side})`, x1 - 2, Math.max(14, topY - 4));
+        const topY = Math.min(yTp, ySl, yEntry) - 6;
+        const botY = Math.max(yTp, ySl, yEntry) + 6;
+        ctx.save();
+        ctx.strokeStyle = '#00e5ff';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(x1 - 4, topY, w + 8, botY - topY);
+        ctx.fillStyle = '#00e5ff';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillText(`Trade #${b.trade_no} (${b.side})`, x1 - 2, Math.max(14, topY - 4));
         ctx.restore();
       }
     });
@@ -2498,43 +3620,85 @@ function drawCanvasZones() {
 }
 
 function updateTradeLogTable(data) {
-  const tbody = document.querySelector('#trade-log-table tbody'); tbody.innerHTML = '';
-  const trades = data.backtest.trades || [];
-  document.getElementById('trade-count-badge').textContent = `${trades.length} Total Executions`;
+  const tbody = document.querySelector('#trade-log-table tbody');
+  tbody.innerHTML = '';
+  const maxIdx = replayActive ? replayIndex : (data.candles.length - 1);
+  const cutoffTime = data.candles[maxIdx] ? data.candles[maxIdx].time : Infinity;
+
+  const stratTrades = (data.backtest.trades || []).filter(t => t.entry_time <= cutoffTime);
+  const manTrades = manualSimResult ? manualSimResult.trades : [];
+  const trades = [...manTrades, ...stratTrades];
+
+  document.getElementById('trade-count-badge').textContent = `${trades.length} Executions (${manTrades.length} Manual Replay)`;
+
   if (trades.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="17" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="17" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view yet. Use Bar-by-Bar Replay or switch strategy.</td></tr>`;
     return;
   }
+
   trades.forEach(t => {
     const tr = document.createElement('tr');
-    tr.style.cursor = 'pointer'; tr.title = 'Click to zoom chart directly to this trade';
-    tr.onclick = () => { if (!isReplay) focusTradeOnChart(t, tr); };
-    const sideCls = t.side === 'LONG' ? 'pos' : 'neg'; const pnlCls = t.pnl >= 0 ? 'pos' : 'neg';
-    const resBadge = (t.type === 'TP' || t.type === 'TRAIL-WIN') ? `<span class="pill pill-cheap">${t.type}</span>` : (t.type === 'SL' ? `<span class="pill pill-exp">SL LOSS</span>` : (t.type === 'CLOSE' ? `<span class="pill" style="background:#ff9800;color:#fff;">CLOSE</span>` : `<span class="pill pill-fair">OPEN</span>`));
+    tr.style.cursor = 'pointer';
+    tr.title = 'Click to zoom chart directly to this trade';
+    tr.onclick = () => focusTradeOnChart(t, tr);
+
+    const sideCls = t.side === 'LONG' ? 'pos' : 'neg';
+    const pnlCls = t.pnl >= 0 ? 'pos' : 'neg';
+    const resBadge = (t.type === 'TP' || t.type === 'TRAIL-WIN' || t.type === 'MANUAL-WIN')
+      ? `<span class="pill pill-cheap">${t.type}</span>`
+      : (t.type === 'SL' ? `<span class="pill pill-exp">SL LOSS</span>` : `<span class="pill pill-fair">${t.type}</span>`);
+
     tr.innerHTML = `
-      <td>${t.trade_no}</td><td class="${sideCls}"><b>${t.side}</b></td><td>${t.signal_type}</td><td>${t.pool}</td><td>${t.entry_dt}</td><td><b>$${t.entry_price}</b></td>
-      <td style="color:#ffd600; font-weight:700;">${t.shares.toLocaleString()} sh (RVOL ${t.bar_rvol}x)</td><td>$${t.position_value.toLocaleString()} (${t.alloc_pct}%)</td>
-      <td>$${t.dollar_risk.toLocaleString()}</td><td>$${t.sl_price} / $${t.tp_price}</td><td style="color:#80d8ff; font-size:10.5px;">${t.scale_summary || '100% @ Exit'}</td>
-      <td>${t.exit_dt}</td><td>$${t.exit_price}</td><td>${resBadge}</td><td class="${pnlCls}"><b>${t.pnl >= 0 ? '+' : ''}$${t.pnl.toLocaleString()}</b></td>
-      <td class="${pnlCls}">${t.ret_pct >= 0 ? '+' : ''}${t.ret_pct}%</td><td><b>$${t.equity_after.toLocaleString()}</b></td>
+      <td>${t.trade_no}</td>
+      <td class="${sideCls}"><b>${t.side}</b></td>
+      <td>${t.signal_type}</td>
+      <td>${t.pool}</td>
+      <td>${t.entry_dt}</td>
+      <td><b>$${t.entry_price}</b></td>
+      <td style="color:#ffd600; font-weight:700;">${t.shares.toLocaleString()} sh (RVOL ${t.bar_rvol}x)</td>
+      <td>$${t.position_value.toLocaleString()} (${t.alloc_pct}%)</td>
+      <td>$${t.dollar_risk.toLocaleString()}</td>
+      <td>$${t.sl_price} / $${t.tp_price}</td>
+      <td style="color:#80d8ff; font-size:10.5px;">${t.scale_summary || '100% @ Exit'}</td>
+      <td>${t.exit_dt}</td>
+      <td>$${t.exit_price}</td>
+      <td>${resBadge}</td>
+      <td class="${pnlCls}"><b>${t.pnl >= 0 ? '+' : ''}$${t.pnl.toLocaleString()}</b></td>
+      <td class="${pnlCls}">${t.ret_pct >= 0 ? '+' : ''}${t.ret_pct}%</td>
+      <td><b>$${t.equity_after.toLocaleString()}</b></td>
     `;
     tbody.appendChild(tr);
   });
 }
 
 function updateSummaryTable(data) {
-  const tbody = document.querySelector('#summary-table tbody'); tbody.innerHTML = '';
+  const tbody = document.querySelector('#summary-table tbody');
+  tbody.innerHTML = '';
   const activeKey = document.getElementById('strategy').value;
-  if (data.all_strategies_summary.length > 0) document.getElementById('bh-badge').textContent = `Buy & Hold: ${data.all_strategies_summary[0].buy_hold_pct >= 0 ? '+' : ''}${data.all_strategies_summary[0].buy_hold_pct}%`;
+
+  if (data.all_strategies_summary.length > 0) {
+    const bh = data.all_strategies_summary[0].buy_hold_pct;
+    document.getElementById('bh-badge').textContent = `Buy & Hold: ${bh >= 0 ? '+' : ''}${bh}%`;
+  }
+
   data.all_strategies_summary.forEach(row => {
     const tr = document.createElement('tr');
     if (row.strategy_key === activeKey) tr.className = 'highlight-row';
     tr.style.cursor = 'pointer';
-    tr.onclick = () => { document.getElementById('strategy').value = row.strategy_key; loadChartData(); };
+    tr.onclick = () => {
+      document.getElementById('strategy').value = row.strategy_key;
+      loadChartData();
+    };
     const cls = row.net_return_pct >= 0 ? 'pos' : 'neg';
     tr.innerHTML = `
-      <td>${row.strategy_name}</td><td>${row.bucket}</td><td>$${row.ending_equity.toLocaleString()}</td><td class="${cls}">${row.net_return_pct >= 0 ? '+' : ''}${row.net_return_pct}%</td>
-      <td>${row.total_trades} (${row.long_trades}L / ${row.short_trades}S)</td><td>${row.win_rate_pct}%</td><td>${row.profit_factor}</td><td class="neg">-${row.max_dd_pct}%</td>
+      <td>${row.strategy_name}</td>
+      <td>${row.bucket}</td>
+      <td>$${row.ending_equity.toLocaleString()}</td>
+      <td class="${cls}">${row.net_return_pct >= 0 ? '+' : ''}${row.net_return_pct}%</td>
+      <td>${row.total_trades} (${row.long_trades}L / ${row.short_trades}S)</td>
+      <td>${row.win_rate_pct}%</td>
+      <td>${row.profit_factor}</td>
+      <td class="neg">-${row.max_dd_pct}%</td>
     `;
     tbody.appendChild(tr);
   });
@@ -2542,8 +3706,12 @@ function updateSummaryTable(data) {
 
 async function calcOptions() {
   const params = new URLSearchParams({
-    spot: document.getElementById('opt_spot').value, strike: document.getElementById('opt_strike').value, dte: document.getElementById('opt_dte').value,
-    iv_pct: document.getElementById('opt_iv').value, gk_daily_vol_pct: document.getElementById('opt_gk').value, opt_type: document.getElementById('opt_type').value
+    spot: document.getElementById('opt_spot').value,
+    strike: document.getElementById('opt_strike').value,
+    dte: document.getElementById('opt_dte').value,
+    iv_pct: document.getElementById('opt_iv').value,
+    gk_daily_vol_pct: document.getElementById('opt_gk').value,
+    opt_type: document.getElementById('opt_type').value
   });
   const res = await fetch(`/api/options_greeks?${params.toString()}`);
   const d = await res.json();
@@ -2557,7 +3725,12 @@ async function calcOptions() {
 
 async function loadOptionChain(selectedExp = '') {
   if (!currentData) return;
-  const params = new URLSearchParams({ ticker: currentData.ticker, spot: currentData.latest_metrics.close, gk_daily_vol_pct: currentData.latest_metrics.gk_daily_vol_pct });
+  const params = new URLSearchParams({
+    ticker: currentData.ticker,
+    spot: currentData.latest_metrics.close,
+    gk_daily_vol_pct: currentData.latest_metrics.gk_daily_vol_pct,
+    max_dte: 60
+  });
   if (selectedExp) params.append('expiry', selectedExp);
 
   const res = await fetch(`/api/option_chain?${params.toString()}`);
@@ -2567,42 +3740,117 @@ async function loadOptionChain(selectedExp = '') {
   const expSel = document.getElementById('chain_expiry');
   expSel.innerHTML = '';
   (data.expirations || []).forEach(exp => {
-    const opt = document.createElement('option'); opt.value = exp; opt.textContent = exp;
+    const opt = document.createElement('option');
+    opt.value = exp;
+    opt.textContent = `${exp}`;
     if (exp === data.selected_expiry) opt.selected = true;
     expSel.appendChild(opt);
   });
 
+  if (data.dte) {
+    document.getElementById('opt_dte').value = data.dte;
+  }
+
   const renderSide = (rows, tbodyId, optType) => {
-    const tb = document.querySelector(`#${tbodyId} tbody`); tb.innerHTML = '';
+    const tb = document.querySelector(`#${tbodyId} tbody`);
+    tb.innerHTML = '';
     (rows || []).forEach(r => {
-      const tr = document.createElement('tr'); tr.style.cursor = 'pointer';
+      const tr = document.createElement('tr');
+      tr.style.cursor = 'pointer';
       tr.onclick = () => {
-        document.getElementById('opt_strike').value = r.strike; document.getElementById('opt_iv').value = r.iv_pct; document.getElementById('opt_type').value = optType;
-        calcOptions(); loadContractHistory(r.contractSymbol, r.strike, optType, r.iv_pct);
+        document.getElementById('opt_strike').value = r.strike;
+        document.getElementById('opt_iv').value = r.iv_pct;
+        document.getElementById('opt_type').value = optType;
+        if (r.dte) document.getElementById('opt_dte').value = r.dte;
+        calcOptions();
+        lastSelectedOptionContract = { sym: r.contractSymbol, strike: r.strike, optType, ivPct: r.iv_pct };
+        loadContractHistory(r.contractSymbol, r.strike, optType, r.iv_pct);
       };
       const pillCls = r.verdict === 'CHEAP' ? 'pill-cheap' : (r.verdict === 'EXPENSIVE' ? 'pill-exp' : 'pill-fair');
-      tr.innerHTML = `<td><b>$${r.strike}</b></td><td>$${r.lastPrice}</td><td>$${r.bid} / $${r.ask}</td><td>${r.iv_pct}%</td><td>${r.delta}</td><td>${r.volume} / ${r.openInterest}</td><td><span class="pill ${pillCls}">${r.verdict}</span></td>`;
+      tr.innerHTML = `
+        <td><b>$${r.strike}</b></td>
+        <td>${r.dte || data.dte || '-'}d</td>
+        <td>$${r.lastPrice}</td>
+        <td>$${r.bid} / $${r.ask}</td>
+        <td>${r.iv_pct}%</td>
+        <td>${r.delta}</td>
+        <td>${r.volume} / ${r.openInterest}</td>
+        <td><span class="pill ${pillCls}">${r.verdict}</span></td>
+      `;
       tb.appendChild(tr);
     });
   };
-  renderSide(data.calls, 'calls-table', 'call'); renderSide(data.puts, 'puts-table', 'put');
+
+  renderSide(data.calls, 'calls-table', 'call');
+  renderSide(data.puts, 'puts-table', 'put');
+
+  if (lastSelectedOptionContract) {
+    loadContractHistory(
+      lastSelectedOptionContract.sym,
+      lastSelectedOptionContract.strike,
+      lastSelectedOptionContract.optType,
+      lastSelectedOptionContract.ivPct
+    );
+  }
 }
 
 async function loadContractHistory(contractSym, strike, optType, ivPct) {
-  const params = new URLSearchParams({ contract_symbol: contractSym, ticker: currentData.ticker, strike: strike, opt_type: optType, iv_pct: ivPct });
+  const params = new URLSearchParams({
+    contract_symbol: contractSym,
+    ticker: currentData.ticker,
+    strike: strike,
+    opt_type: optType,
+    iv_pct: ivPct
+  });
   const res = await fetch(`/api/option_contract_history?${params.toString()}`);
   const d = await res.json();
-  const box = document.getElementById('contract-history-box'); box.style.display = 'block';
-  document.getElementById('contract-hist-title').textContent = `Option Contract Daily History: ${d.contract} (${d.source}) — Last ${d.bars.length} Sessions`;
-  const strip = document.getElementById('contract-hist-strip'); strip.innerHTML = '';
-  d.bars.slice(-15).forEach(b => {
-    const card = document.createElement('div'); card.style.cssText = 'background:#131722; border:1px solid #2a2e39; border-radius:4px; padding:5px 8px; min-width:92px; font-size:10.5px;';
+  const box = document.getElementById('contract-history-box');
+  box.style.display = 'block';
+  document.getElementById('contract-hist-title').textContent =
+    `Option Contract 60-Day History: ${d.contract} (${d.source}) — Showing All ${d.bars.length} Sessions`;
+  const strip = document.getElementById('contract-hist-strip');
+  strip.innerHTML = '';
+  d.bars.slice(-60).forEach(b => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:#131722; border:1px solid #2a2e39; border-radius:4px; padding:5px 8px; min-width:92px; font-size:10.5px;';
     card.innerHTML = `<div style="color:#787b86">${b.date}</div><div style="font-weight:700; color:#00e676">$${b.close}</div><div style="color:#90a4ae">H:$${b.high} L:$${b.low}</div>`;
     strip.appendChild(card);
   });
 }
 
-window.onload = () => { initChart(); resetToRoot(); startPolling(); };
+// ==============================================================================
+// 1-MINUTE LIVE AUTO-UPDATE LOOP (FOR 1m TIMEFRAME & 60-DAY OPTION DATA)
+// ==============================================================================
+function startOneMinuteAutoRefreshLoop() {
+  setInterval(async () => {
+    liveRefreshCountdown--;
+    const badge = document.getElementById('live-refresh-badge');
+    if (liveRefreshCountdown <= 0) {
+      liveRefreshCountdown = 60;
+      if (badge) badge.textContent = '⟳ Syncing 1m & Options...';
+      // Always refresh 60-day Option Chain & Contract History every 1 minute
+      if (currentData && !replayActive) {
+        if (currentTF === '1m') {
+          await loadChartData(true);
+        } else {
+          await loadOptionChain(document.getElementById('chain_expiry').value || '');
+        }
+      } else if (currentData && replayActive) {
+        // Even during replay, keep live option chain refreshed in background
+        await loadOptionChain(document.getElementById('chain_expiry').value || '');
+      }
+    }
+    if (badge) {
+      badge.textContent = `⟳ 1m & Options Sync: ${liveRefreshCountdown}s`;
+    }
+  }, 1000);
+}
+
+window.onload = () => {
+  initChart();
+  resetToRoot();
+  startOneMinuteAutoRefreshLoop();
+};
 </script>
 </body>
 </html>
