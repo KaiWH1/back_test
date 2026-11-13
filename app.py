@@ -12,7 +12,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Full-History Multi-Timeframe Backtest, Hover HUD & Trade Log")
+app = FastAPI(title="Quant Lab: Dynamic SL/TP, Scale-Out Ladder, Dual-Pool Ledger & Smart Trade Zoom")
+
 
 # ==============================================================================
 # 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
@@ -116,6 +117,7 @@ def _direct_yahoo_v8_chart(ticker: str, interval: str, days_back: Optional[int] 
         "close": quote["close"],
         "volume": quote["volume"]
     }, index=pd.to_datetime(timestamps, unit="s"))
+
     df.index = df.index.tz_localize(None)
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
     df["volume"] = df["volume"].fillna(0.0).clip(lower=0.0)
@@ -179,7 +181,6 @@ def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
     chunks = []
     now = datetime.now() + timedelta(days=1)
     t_obj = yf.Ticker(ticker)
-
     for w in range(4):
         end_dt = now - timedelta(days=w * 7)
         start_dt = now - timedelta(days=(w + 1) * 7)
@@ -192,19 +193,16 @@ def _fetch_max_1m_stitched(ticker: str) -> pd.DataFrame:
                 chunks.append(part)
         except Exception:
             continue
-
     if chunks:
         df_all = pd.concat(chunks).sort_index()
         df_all = df_all[~df_all.index.duplicated(keep='last')]
         return df_all.replace([np.inf, -np.inf], np.nan).dropna()
-
     return _direct_yahoo_v8_chart(ticker, interval="1m", days_back=7)
 
 
 def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.DataFrame:
     df_1d, _ = _download_daily_max(ticker)
     df_1d = df_1d.tail(days)
-
     step_mins = {"1h": 60, "15m": 15, "5m": 5, "1m": 1}.get(interval, 15)
     bars_per_day = max(1, int(390 / step_mins))
     all_rows = []
@@ -216,7 +214,6 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
         noise = np.cumsum(np.random.normal(0, 1, bars_per_day))
         noise = (noise - noise[0]) / (np.ptp(noise) + 1e-6)
         path = o + (c - o) * t_space + (h - l) * 0.35 * (noise - 0.5)
-
         if bars_per_day >= 3:
             max_i, min_i = int(bars_per_day * 0.3), int(bars_per_day * 0.65)
             path[max_i] = h
@@ -243,7 +240,6 @@ def _generate_intraday_from_daily(ticker: str, interval: str, days: int) -> pd.D
                 "close": b_close,
                 "volume": b_vol
             })
-
     return pd.DataFrame(all_rows).set_index("dt")
 
 
@@ -256,7 +252,6 @@ def _is_data_fresh(df: pd.DataFrame) -> bool:
 
 def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
     csv_path = os.path.join(CACHE_DIR, f"{ticker}_1d_fullmax.csv")
-
     if os.path.exists(csv_path):
         try:
             age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
@@ -325,7 +320,6 @@ def _download_daily_max(ticker: str) -> tuple[pd.DataFrame, Optional[str]]:
 def _download_intraday_max(ticker: str, interval: str) -> tuple[pd.DataFrame, Optional[str]]:
     max_days = YF_LIMIT_DAYS.get(interval, 59)
     csv_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}_fullmax.csv")
-
     if os.path.exists(csv_path):
         try:
             age_hours = (datetime.now().timestamp() - os.path.getmtime(csv_path)) / 3600.0
@@ -380,7 +374,6 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
             DATA_CACHE[base_key] = df_1d
 
         df_base = DATA_CACHE[base_key].copy()
-
         if tf == "1d":
             return df_base, warn_msg
 
@@ -400,7 +393,6 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
         }).dropna()
         df_res.index.name = "date"
         return df_res, warn_msg
-
     else:
         warn_msg = None
         if cache_key not in DATA_CACHE:
@@ -408,18 +400,18 @@ def fetch_and_construct_tf(ticker: str, tf: str) -> tuple[pd.DataFrame, Optional
             if df_intra.empty:
                 return pd.DataFrame(), warn_msg or f"No {tf} data found for {ticker}."
             DATA_CACHE[cache_key] = df_intra
-
         return DATA_CACHE[cache_key].copy(), warn_msg
 
 
 # ==============================================================================
-# 2. QUANTITATIVE INDICATORS & POINT-IN-TIME ENGINE (ZERO-NaN GUARANTEED)
+# 2. QUANTITATIVE INDICATORS & DYNAMIC SL/TP FORMULA ENGINE (ZERO-NaN)
 # ==============================================================================
 def compute_all_indicators(
     df: pd.DataFrame,
     tf: str,
     atr_mult: float = 1.5,
-    gk_mult: float = 2.0,
+    gk_mult: float = 3.0,
+    dynamic_tpsl: bool = True,
     w_trend: float = 0.4,
     w_liq: float = 0.4,
     w_rev: float = 0.2
@@ -427,7 +419,6 @@ def compute_all_indicators(
     df = df.copy()
     n = len(df)
     unavailable_indicators = []
-
     if n == 0:
         return df, ["All Indicators (Empty Data)"]
 
@@ -436,7 +427,6 @@ def compute_all_indicators(
     if n < 50:
         unavailable_indicators.append("EMA 50 (< 50 bars in view)")
 
-    # Use min_periods=1 so early IPO bars never contain NaN floats
     df['ema20'] = df['close'].ewm(span=20, min_periods=1).mean().bfill().fillna(df['close'])
     df['ema50'] = df['close'].ewm(span=50, min_periods=1).mean().bfill().fillna(df['close'])
 
@@ -454,13 +444,6 @@ def compute_all_indicators(
     gk_var = (0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)).clip(lower=1e-8)
     df['gk_vol_pct'] = np.sqrt(gk_var.ewm(span=20, min_periods=1).mean()).bfill().fillna(0.02)
     df['gk_sigma_dollar'] = (df['gk_vol_pct'] * df['close']).bfill().fillna(df['atr'])
-
-    drift = ((df['close'] - df['close'].shift(3)).fillna(0.0)) / 3.0
-    df['gk_upper'] = df['close'] + drift + (gk_mult * df['gk_sigma_dollar'])
-    df['gk_lower'] = df['close'] + drift - (gk_mult * df['gk_sigma_dollar'])
-
-    df['atr_upper'] = df['close'] + (atr_mult * df['atr'])
-    df['atr_lower'] = df['close'] - (atr_mult * df['atr'])
 
     df['vol_sma20'] = df['volume'].rolling(20, min_periods=1).mean().replace(0, 1.0).fillna(1.0)
     df['rvol'] = (df['volume'] / df['vol_sma20']).replace([np.inf, -np.inf], np.nan).fillna(1.0)
@@ -545,7 +528,6 @@ def compute_all_indicators(
     df['orb_high'] = np.nan
     df['orb_low'] = np.nan
     df['orb_mid'] = np.nan
-
     if tf in ["15m", "5m", "1m"]:
         for dt, group in df.groupby(df.index.date):
             start_t = group.index[0]
@@ -579,11 +561,44 @@ def compute_all_indicators(
         (df['atr'] > 1.35 * df['atr'].rolling(20, min_periods=1).mean()) & (df['composite_score'].abs() < 0.20)
     )
 
+    # --------------------------------------------------------------------------
+    # DYNAMIC SL / TP FORMULA ENGINE
+    # Computes bar-by-bar optimal SL & TP volatility multipliers based on:
+    # 1. VolRatio = GK_Vol / SMA20(GK_Vol)
+    # 2. TrendStrength = |EMA20 - EMA50| / ATR
+    # 3. Liquidity Impulse = RVOL and Composite Score conviction
+    # --------------------------------------------------------------------------
+    gk_sma20 = df['gk_vol_pct'].rolling(20, min_periods=1).mean().replace(0, 0.02).fillna(0.02)
+    vol_ratio = (df['gk_vol_pct'] / gk_sma20).clip(0.65, 1.85)
+    trend_strength = ema_diff_ratio.clip(0.0, 3.0)
+    rvol_boost = (df['rvol'] - 1.0).clip(-0.4, 1.5)
+    chop_penalty = np.where(df['is_unclear_volatile'], 1.12, 1.0)
+
+    if dynamic_tpsl:
+        dyn_sl = (atr_mult * np.sqrt(vol_ratio) * chop_penalty).clip(0.75, 3.50)
+        dyn_tp_raw = (
+            gk_mult
+            * (0.75 + 0.35 * trend_strength + 0.20 * rvol_boost)
+            * (1.0 + 0.25 * df['composite_score'].abs())
+        )
+        dyn_tp = np.maximum(dyn_sl * 1.25, dyn_tp_raw).clip(1.10, 7.50)
+        df['dyn_sl_mult'] = dyn_sl.bfill().fillna(atr_mult)
+        df['dyn_tp_mult'] = dyn_tp.bfill().fillna(gk_mult)
+    else:
+        df['dyn_sl_mult'] = float(atr_mult)
+        df['dyn_tp_mult'] = float(gk_mult)
+
+    drift = ((df['close'] - df['close'].shift(3)).fillna(0.0)) / 3.0
+    df['gk_upper'] = df['close'] + drift + (df['dyn_tp_mult'] * df['gk_sigma_dollar'])
+    df['gk_lower'] = df['close'] + drift - (df['dyn_tp_mult'] * df['gk_sigma_dollar'])
+    df['atr_upper'] = df['close'] + (df['dyn_sl_mult'] * df['atr'])
+    df['atr_lower'] = df['close'] - (df['dyn_sl_mult'] * df['atr'])
+
     return df, unavailable_indicators
 
 
 # ==============================================================================
-# 3. BIDIRECTIONAL (LONG & SHORT) LIFECYCLE BACKTEST ENGINE + DETAILED TRADE LOG
+# 3. DUAL-POOL PORTFOLIO, SCALE-OUT LADDER & BIDIRECTIONAL BACKTEST ENGINE
 # ==============================================================================
 STRATEGY_METADATA = {
     "trend": {
@@ -621,8 +636,13 @@ STRATEGY_METADATA = {
         "indicators": ["ema20", "vwap", "gk_bands"],
         "bucket": "Core 70%"
     },
+    "scale_ladder": {
+        "name": "8. Momentum Scale-Out Ladder (Sell xx% @ +xx% Tiers)",
+        "indicators": ["ema20", "vwap", "gk_bands", "atr_bands"],
+        "bucket": "Core 70%"
+    },
     "plain_tpsl": {
-        "name": "8. Plain TP/SL & Manual Click Sandbox",
+        "name": "9. Plain TP/SL & Manual Click Sandbox",
         "indicators": ["atr_bands", "gk_bands"],
         "bucket": "Sandbox"
     }
@@ -643,6 +663,11 @@ def run_strategy_backtest(
     sl_mult: float = 1.5,
     tp_mult: float = 3.0,
     vol_model: str = "atr",
+    enable_scale_out: bool = True,
+    t1_gain_pct: float = 4.0,
+    t1_sell_pct: float = 35.0,
+    t2_gain_pct: float = 8.0,
+    t2_sell_pct: float = 35.0,
     initial_capital: float = 100000.0,
     core_pct: float = 0.70,
     intraday_pct: float = 0.30,
@@ -666,7 +691,8 @@ def run_strategy_backtest(
     volumes = df['volume'].values
     atrs = df['atr'].values
     gks = df['gk_sigma_dollar'].values
-
+    dyn_sl_arr = df['dyn_sl_mult'].values
+    dyn_tp_arr = df['dyn_tp_mult'].values
     ema20 = df['ema20'].values
     ema50 = df['ema50'].values
     rvol = df['rvol'].values
@@ -685,11 +711,14 @@ def run_strategy_backtest(
     comp_score = df['composite_score'].values
     rsi = df['rsi'].values
 
+    # --------------------------------------------------------------------------
+    # TRUE DUAL-POOL PORTFOLIO LEDGER (Core 70% vs Intraday 30%)
+    # --------------------------------------------------------------------------
     is_intraday_strat = strategy_key in ["orb", "do_t", "smc_fvg"]
-    pool_fraction = intraday_pct if is_intraday_strat else core_pct
+    core_cash = initial_capital * core_pct
+    intraday_cash = initial_capital * intraday_pct
     pool_label = f"Intraday ({int(intraday_pct*100)}%)" if is_intraday_strat else f"Core ({int(core_pct*100)}%)"
 
-    equity = initial_capital
     peak_equity = initial_capital
     max_dd_pct = 0.0
 
@@ -698,11 +727,23 @@ def run_strategy_backtest(
     watch_trough = 0.0
     entry_price = 0.0
     sl_price = 0.0
+    initial_sl_price = 0.0
     tp_price = 0.0
     alt_sl_price = 0.0
     alt_tp_price = 0.0
+    entry_sl_mult_used = sl_mult
+    entry_tp_mult_used = tp_mult
     entry_idx = 0
-    position_shares = 0
+
+    initial_shares = 0
+    remaining_shares = 0
+    reserved_cash = 0.0
+    realized_trade_pnl = 0.0
+    scale_stage = 0  # 0 = untouched, 1 = T1 hit, 2 = T2 hit
+    t1_target_price = 0.0
+    t2_target_price = 0.0
+    scale_notes: List[str] = []
+
     entry_signal_reason = ""
     dollar_risk_at_entry = 0.0
 
@@ -711,23 +752,71 @@ def run_strategy_backtest(
     boxes = []
     equity_curve = []
 
-    def _calc_shares(curr_eq: float, ep: float, slp: float) -> tuple[int, float]:
-        risk_budget = max(curr_eq, 1000.0) * risk_per_trade_pct
-        max_pool_dollars = max(curr_eq, 1000.0) * pool_fraction
-        stop_dist = max(abs(ep - slp), ep * 0.005, 0.01)
-        raw_shares = min(risk_budget / stop_dist, max_pool_dollars / max(ep, 0.01))
+    def _get_active_pool_cash() -> float:
+        return intraday_cash if is_intraday_strat else core_cash
+
+    def _set_active_pool_cash(new_val: float) -> None:
+        nonlocal core_cash, intraday_cash
+        if is_intraday_strat:
+            intraday_cash = new_val
+        else:
+            core_cash = new_val
+
+    def _total_portfolio_equity(mark_price: float) -> float:
+        open_val = 0.0
+        if state == 2 and remaining_shares > 0:
+            open_val = remaining_shares * mark_price
+        elif state == -2 and remaining_shares > 0:
+            # Short position collateral + unrealized PnL
+            open_val = reserved_cash + (entry_price - mark_price) * remaining_shares
+        return core_cash + intraday_cash + open_val
+
+    def _calc_shares(ep: float, slp: float) -> tuple[int, float]:
+        tot_eq = max(_total_portfolio_equity(ep), 1000.0)
+        avail_pool_cash = max(_get_active_pool_cash(), 0.0)
+        if avail_pool_cash < ep:
+            return 0, 0.0
+        risk_budget = tot_eq * risk_per_trade_pct
+        stop_dist = max(abs(ep - slp), ep * 0.004, 0.01)
+        # Cannot exceed either the risk-per-trade budget OR the actual cash available in this bucket
+        raw_shares = min(risk_budget / stop_dist, (avail_pool_cash * 0.98) / max(ep, 0.01))
         if math.isnan(raw_shares) or math.isinf(raw_shares):
-            raw_shares = 1.0
-        shares_int = max(1, int(round(raw_shares)))
+            raw_shares = 0.0
+        shares_int = max(0, int(math.floor(raw_shares)))
+        if shares_int == 0 and avail_pool_cash >= ep:
+            shares_int = 1
         actual_risk = shares_int * abs(ep - slp)
         return shares_int, actual_risk
+
+    def _compute_tier_targets(ep: float, tp_p: float, is_long: bool) -> tuple[float, float]:
+        """
+        Combines user's explicit percentage gain ladder (+t1_gain_pct%, +t2_gain_pct%)
+        with adaptive fraction of the dynamic TP distance so intraday (1m/5m) and macro (1D/1Y)
+        timeframes both hit scale-out tiers naturally.
+        """
+        full_dist = abs(tp_p - ep)
+        pct_dist_1 = ep * (max(t1_gain_pct, 0.1) / 100.0)
+        pct_dist_2 = ep * (max(t2_gain_pct, 0.2) / 100.0)
+        # Use whichever is more realistic for the current timeframe's volatility
+        d1 = min(pct_dist_1, full_dist * 0.45) if tf in ["1h", "15m", "5m", "1m"] else min(pct_dist_1, full_dist * 0.55)
+        d2 = min(pct_dist_2, full_dist * 0.78) if tf in ["1h", "15m", "5m", "1m"] else min(pct_dist_2, full_dist * 0.82)
+        d1 = max(d1, ep * 0.002)
+        d2 = max(d2, d1 * 1.35)
+        if is_long:
+            return ep + d1, ep + d2
+        else:
+            return ep - d1, ep - d2
 
     for i in range(1, n):
         ts = timestamps[i]
         c_high, c_low, c_close, c_open = highs[i], lows[i], closes[i], opens[i]
+
         unit_vol = gks[i] if vol_model == "gk" else atrs[i]
         if np.isnan(unit_vol) or math.isinf(unit_vol) or unit_vol <= 0:
             unit_vol = max(c_close * 0.015, 0.01)
+
+        cur_sl_mult = _clean_float(dyn_sl_arr[i], sl_mult, 2)
+        cur_tp_mult = _clean_float(dyn_tp_arr[i], tp_mult, 2)
 
         trend_long, trend_short = False, False
         trig_long, trig_short = False, False
@@ -735,7 +824,6 @@ def run_strategy_backtest(
         if strategy_key == "trend":
             trend_long = c_close > ema50[i] and ema20[i] > ema50[i]
             trig_long = trend_long and (c_low <= ema20[i] * 1.008) and (c_close > c_open) and (rvol[i] >= 0.9)
-
             trend_short = c_close < ema50[i] and ema20[i] < ema50[i]
             trig_short = trend_short and (c_high >= ema20[i] * 0.992) and (c_close < c_open) and (rvol[i] >= 0.9)
 
@@ -758,7 +846,6 @@ def run_strategy_backtest(
         elif strategy_key == "fib_golden":
             trend_long = c_close > fib_786[i] and ema20[i] >= ema50[i] * 0.99
             trig_long = trend_long and (c_low <= fib_618[i] * 1.005) and (c_close >= fib_618[i]) and (rsi[i] < 60)
-
             trend_short = c_close < swing_high[i] and ema20[i] < ema50[i] * 1.01
             trig_short = trend_short and (c_high >= fib_382[i] * 0.995) and (c_close <= fib_382[i]) and (rsi[i] > 40)
 
@@ -766,23 +853,26 @@ def run_strategy_backtest(
             if not np.isnan(orb_high[i]) and not np.isnan(orb_low[i]):
                 trend_long = c_close > orb_mid[i] and c_close > vwap[i]
                 trig_long = (closes[i - 1] <= orb_high[i - 1]) and (c_close > orb_high[i]) and (rvol[i] >= 1.2)
-
                 trend_short = c_close < orb_mid[i] and c_close < vwap[i]
                 trig_short = (closes[i - 1] >= orb_low[i - 1]) and (c_close < orb_low[i]) and (rvol[i] >= 1.2)
 
         elif strategy_key == "do_t":
             trend_long = c_close > ema50[i] * 0.93
             trig_long = (c_low <= vwap_l2[i]) and (c_close > c_open)
-
             trend_short = c_close < ema50[i] * 1.07
             trig_short = (c_high >= vwap_u2[i]) and (c_close < c_open)
 
         elif strategy_key == "composite":
             trend_long = comp_score[i] > 0.15
             trig_long = comp_score[i] >= 0.48
-
             trend_short = comp_score[i] < -0.15
             trig_short = comp_score[i] <= -0.48
+
+        elif strategy_key == "scale_ladder":
+            trend_long = (c_close > ema20[i]) and (ema20[i] >= ema50[i] * 0.995)
+            trig_long = trend_long and (c_close > vwap[i]) and (rvol[i] >= 1.05) and (c_close > c_open)
+            trend_short = (c_close < ema20[i]) and (ema20[i] <= ema50[i] * 1.005)
+            trig_short = trend_short and (c_close < vwap[i]) and (rvol[i] >= 1.05) and (c_close < c_open)
 
         elif strategy_key == "plain_tpsl":
             if manual_entry_ts is not None:
@@ -804,33 +894,50 @@ def run_strategy_backtest(
         if not allow_short:
             trend_short, trig_short = False, False
 
+        # ----------------------------------------------------------------------
+        # STATE MACHINE TRANSITIONS
+        # ----------------------------------------------------------------------
         if state == 0:
             if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
                 is_long = trig_long
-                state = 2 if is_long else -2
                 entry_price = c_close
                 entry_idx = i
+                entry_sl_mult_used = cur_sl_mult
+                entry_tp_mult_used = cur_tp_mult
                 safe_atr = _clean_float(atrs[i], c_close * 0.015)
                 safe_gk = _clean_float(gks[i], safe_atr)
                 if is_long:
-                    sl_price = entry_price - sl_mult * safe_atr
-                    tp_price = entry_price + tp_mult * safe_atr
-                    alt_sl_price = entry_price - sl_mult * safe_gk
-                    alt_tp_price = entry_price + tp_mult * safe_gk
+                    sl_price = entry_price - cur_sl_mult * safe_atr
+                    tp_price = entry_price + cur_tp_mult * safe_atr
+                    alt_sl_price = entry_price - cur_sl_mult * safe_gk
+                    alt_tp_price = entry_price + cur_tp_mult * safe_gk
                 else:
-                    sl_price = entry_price + sl_mult * safe_atr
-                    tp_price = entry_price - tp_mult * safe_atr
-                    alt_sl_price = entry_price + sl_mult * safe_gk
-                    alt_tp_price = entry_price - tp_mult * safe_gk
-                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_signal_reason = "MANUAL_CLICK"
-                markers.append({
-                    "time": ts,
-                    "position": "belowBar" if is_long else "aboveBar",
-                    "color": "#00E676" if is_long else "#FF4081",
-                    "shape": "arrowUp" if is_long else "arrowDown",
-                    "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({position_shares} sh @ ${entry_price:.2f})"
-                })
+                    sl_price = entry_price + cur_sl_mult * safe_atr
+                    tp_price = entry_price - cur_tp_mult * safe_atr
+                    alt_sl_price = entry_price + cur_sl_mult * safe_gk
+                    alt_tp_price = entry_price - cur_tp_mult * safe_gk
+
+                sh, d_risk = _calc_shares(entry_price, sl_price)
+                if sh > 0:
+                    state = 2 if is_long else -2
+                    initial_shares = sh
+                    remaining_shares = sh
+                    initial_sl_price = sl_price
+                    dollar_risk_at_entry = d_risk
+                    reserved_cash = sh * entry_price
+                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
+                    realized_trade_pnl = 0.0
+                    scale_stage = 0
+                    scale_notes = []
+                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, is_long)
+                    entry_signal_reason = f"MANUAL ({cur_sl_mult}x/{cur_tp_mult}x)"
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar" if is_long else "aboveBar",
+                        "color": "#00E676" if is_long else "#FF4081",
+                        "shape": "arrowUp" if is_long else "arrowDown",
+                        "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({sh} sh @ ${entry_price:.2f})"
+                    })
             elif trend_long:
                 state = 1
                 watch_peak = c_high
@@ -846,32 +953,44 @@ def run_strategy_backtest(
                 watch_trough = c_low
             elif trig_long:
                 is_re = (state == 3)
-                state = 2
                 entry_price = c_close
                 entry_idx = i
+                entry_sl_mult_used = cur_sl_mult
+                entry_tp_mult_used = cur_tp_mult
                 safe_gk = _clean_float(gks[i], unit_vol)
                 if strategy_key == "do_t":
-                    sl_price = entry_price - (0.85 * unit_vol)
-                    tp_price = max(_clean_float(vwap[i], entry_price), entry_price + 0.8 * unit_vol)
+                    sl_price = entry_price - (0.65 * cur_sl_mult * unit_vol)
+                    tp_price = max(_clean_float(vwap[i], entry_price), entry_price + (0.55 * cur_tp_mult * unit_vol))
                 elif strategy_key == "orb" and not np.isnan(orb_mid[i]):
-                    sl_price = min(float(orb_mid[i]), entry_price - 0.5 * unit_vol)
-                    tp_price = entry_price + tp_mult * max(entry_price - sl_price, 0.5 * unit_vol)
+                    sl_price = min(float(orb_mid[i]), entry_price - 0.5 * cur_sl_mult * unit_vol)
+                    tp_price = entry_price + cur_tp_mult * max(entry_price - sl_price, 0.5 * unit_vol)
                 else:
-                    sl_price = entry_price - sl_mult * unit_vol
-                    tp_price = entry_price + tp_mult * unit_vol
+                    sl_price = entry_price - cur_sl_mult * unit_vol
+                    tp_price = entry_price + cur_tp_mult * unit_vol
+                alt_sl_price = entry_price - cur_sl_mult * safe_gk
+                alt_tp_price = entry_price + cur_tp_mult * safe_gk
 
-                alt_sl_price = entry_price - sl_mult * safe_gk
-                alt_tp_price = entry_price + tp_mult * safe_gk
-
-                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_signal_reason = "RE-ENTRY LONG" if is_re else "INITIAL LONG"
-
-                markers.append({
-                    "time": ts, "position": "belowBar",
-                    "color": "#00B0FF" if is_re else "#00E676",
-                    "shape": "arrowUp",
-                    "text": f"{'RE-BUY' if is_re else 'BUY'} {position_shares} sh @ ${entry_price:.2f}"
-                })
+                sh, d_risk = _calc_shares(entry_price, sl_price)
+                if sh > 0:
+                    state = 2
+                    initial_shares = sh
+                    remaining_shares = sh
+                    initial_sl_price = sl_price
+                    dollar_risk_at_entry = d_risk
+                    reserved_cash = sh * entry_price
+                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
+                    realized_trade_pnl = 0.0
+                    scale_stage = 0
+                    scale_notes = []
+                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, True)
+                    entry_signal_reason = f"{'RE-LONG' if is_re else 'LONG'} ({cur_sl_mult}x/{cur_tp_mult}x)"
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#00B0FF" if is_re else "#00E676",
+                        "shape": "arrowUp",
+                        "text": f"{'RE-BUY' if is_re else 'BUY'} {sh} sh @ ${entry_price:.2f}"
+                    })
 
         elif state in [-1, -3]:
             if not trend_short and manual_entry_ts is None:
@@ -879,151 +998,336 @@ def run_strategy_backtest(
                 watch_peak = c_high
             elif trig_short:
                 is_re = (state == -3)
-                state = -2
                 entry_price = c_close
                 entry_idx = i
+                entry_sl_mult_used = cur_sl_mult
+                entry_tp_mult_used = cur_tp_mult
                 safe_gk = _clean_float(gks[i], unit_vol)
                 if strategy_key == "do_t":
-                    sl_price = entry_price + (0.85 * unit_vol)
-                    tp_price = min(_clean_float(vwap[i], entry_price), entry_price - 0.8 * unit_vol)
+                    sl_price = entry_price + (0.65 * cur_sl_mult * unit_vol)
+                    tp_price = min(_clean_float(vwap[i], entry_price), entry_price - (0.55 * cur_tp_mult * unit_vol))
                 elif strategy_key == "orb" and not np.isnan(orb_mid[i]):
-                    sl_price = max(float(orb_mid[i]), entry_price + 0.5 * unit_vol)
-                    tp_price = entry_price - tp_mult * max(sl_price - entry_price, 0.5 * unit_vol)
+                    sl_price = max(float(orb_mid[i]), entry_price + 0.5 * cur_sl_mult * unit_vol)
+                    tp_price = entry_price - cur_tp_mult * max(sl_price - entry_price, 0.5 * unit_vol)
                 else:
-                    sl_price = entry_price + sl_mult * unit_vol
-                    tp_price = entry_price - tp_mult * unit_vol
+                    sl_price = entry_price + cur_sl_mult * unit_vol
+                    tp_price = entry_price - cur_tp_mult * unit_vol
+                alt_sl_price = entry_price + cur_sl_mult * safe_gk
+                alt_tp_price = entry_price - cur_tp_mult * safe_gk
 
-                alt_sl_price = entry_price + sl_mult * safe_gk
-                alt_tp_price = entry_price - tp_mult * safe_gk
+                sh, d_risk = _calc_shares(entry_price, sl_price)
+                if sh > 0:
+                    state = -2
+                    initial_shares = sh
+                    remaining_shares = sh
+                    initial_sl_price = sl_price
+                    dollar_risk_at_entry = d_risk
+                    reserved_cash = sh * entry_price
+                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
+                    realized_trade_pnl = 0.0
+                    scale_stage = 0
+                    scale_notes = []
+                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, False)
+                    entry_signal_reason = f"{'RE-SHORT' if is_re else 'SHORT'} ({cur_sl_mult}x/{cur_tp_mult}x)"
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#E040FB" if is_re else "#FF4081",
+                        "shape": "arrowDown",
+                        "text": f"{'RE-SHORT' if is_re else 'SHORT'} {sh} sh @ ${entry_price:.2f}"
+                    })
 
-                position_shares, dollar_risk_at_entry = _calc_shares(equity, entry_price, sl_price)
-                entry_signal_reason = "RE-ENTRY SHORT" if is_re else "INITIAL SHORT"
-
-                markers.append({
-                    "time": ts, "position": "aboveBar",
-                    "color": "#E040FB" if is_re else "#FF4081",
-                    "shape": "arrowDown",
-                    "text": f"{'RE-SHORT' if is_re else 'SHORT'} {position_shares} sh @ ${entry_price:.2f}"
-                })
-
+        # ----------------------------------------------------------------------
+        # ACTIVE LONG POSITION MANAGEMENT (WITH MULTI-TRANCHE SCALE-OUT LADDER)
+        # ----------------------------------------------------------------------
         elif state == 2:
+            do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
+            hit_sl = c_low <= sl_price
+
+            # Check Partial Scale-Out Tier 1 & Tier 2 before full exit if SL wasn't hit first
+            if do_ladder and not hit_sl and remaining_shares >= 3:
+                if scale_stage == 0 and c_high >= t1_target_price and t1_target_price < tp_price:
+                    qty1 = max(1, int(round(initial_shares * (t1_sell_pct / 100.0))))
+                    qty1 = min(qty1, remaining_shares - 1)
+                    if qty1 > 0:
+                        part_pnl = (t1_target_price - entry_price) * qty1
+                        realized_trade_pnl += part_pnl
+                        # Return sold tranche principal + profit to bucket cash immediately
+                        _set_active_pool_cash(_get_active_pool_cash() + (qty1 * entry_price) + part_pnl)
+                        remaining_shares -= qty1
+                        reserved_cash = remaining_shares * entry_price
+                        scale_stage = 1
+                        # Ratchet SL to Breakeven
+                        sl_price = max(sl_price, entry_price)
+                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "aboveBar",
+                            "color": "#80D8FF",
+                            "shape": "circle",
+                            "text": f"T1 SELL {qty1}sh (+${part_pnl:,.0f})"
+                        })
+
+                if scale_stage == 1 and c_high >= t2_target_price and t2_target_price < tp_price and remaining_shares >= 2:
+                    qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
+                    qty2 = min(qty2, remaining_shares - 1)
+                    if qty2 > 0:
+                        part_pnl = (t2_target_price - entry_price) * qty2
+                        realized_trade_pnl += part_pnl
+                        _set_active_pool_cash(_get_active_pool_cash() + (qty2 * entry_price) + part_pnl)
+                        remaining_shares -= qty2
+                        reserved_cash = remaining_shares * entry_price
+                        scale_stage = 2
+                        # Ratchet SL to T1 price to lock in gains
+                        sl_price = max(sl_price, t1_target_price)
+                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "aboveBar",
+                            "color": "#40C4FF",
+                            "shape": "circle",
+                            "text": f"T2 SELL {qty2}sh (+${part_pnl:,.0f})"
+                        })
+
             hit_tp = c_high >= tp_price
             hit_sl = c_low <= sl_price
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
-                pnl = (exit_price - entry_price) * position_shares
-                ret_pct = ((exit_price - entry_price) / max(entry_price, 1e-6)) * 100.0
-                pos_val = entry_price * position_shares
-                alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
-                equity += pnl
+                rem_pnl = (exit_price - entry_price) * remaining_shares
+                # Return remaining principal + remaining PnL to bucket cash
+                _set_active_pool_cash(_get_active_pool_cash() + (remaining_shares * entry_price) + rem_pnl)
+                total_pnl = realized_trade_pnl + rem_pnl
+                pos_val = entry_price * initial_shares
+                ret_pct = (total_pnl / max(pos_val, 1e-6)) * 100.0
+
+                remaining_shares = 0
+                reserved_cash = 0.0
+                state_before = scale_stage
+                state = 0
+                cur_eq = _total_portfolio_equity(c_close)
+                alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
+
+                res_type = "TP" if hit_tp else ("TRAIL-WIN" if total_pnl > 0 else "SL")
+                ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
 
                 trades.append({
                     "trade_no": len(trades) + 1,
                     "side": "LONG",
                     "signal_type": entry_signal_reason,
                     "pool": pool_label,
+                    "entry_bar_idx": int(entry_idx),
+                    "exit_bar_idx": int(i),
                     "entry_time": timestamps[entry_idx],
                     "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
                     "exit_dt": _fmt_dt(dt_index[i], tf),
-                    "type": "TP" if hit_tp else "SL",
+                    "type": res_type,
                     "entry_price": _clean_float(entry_price, 0.0, 2),
                     "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(sl_price, 0.0, 2),
+                    "sl_price": _clean_float(initial_sl_price, 0.0, 2),
                     "tp_price": _clean_float(tp_price, 0.0, 2),
-                    "shares": int(position_shares),
+                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+                    "scale_summary": ladder_str,
+                    "shares": int(initial_shares),
                     "position_value": _clean_float(pos_val, 0.0, 2),
                     "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
                     "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
                     "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
                     "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(pnl, 0.0, 2),
+                    "pnl": _clean_float(total_pnl, 0.0, 2),
                     "ret_pct": _clean_float(ret_pct, 0.0, 2),
-                    "equity_after": _clean_float(equity, initial_capital, 2)
+                    "equity_after": _clean_float(cur_eq, initial_capital, 2)
                 })
                 boxes.append({
-                    "side": "LONG", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(sl_price),
-                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price),
-                    "outcome": "TP" if hit_tp else "SL"
+                    "trade_no": len(trades),
+                    "side": "LONG",
+                    "t1": timestamps[entry_idx],
+                    "t2": ts,
+                    "entry": _clean_float(entry_price),
+                    "tp": _clean_float(tp_price),
+                    "sl": _clean_float(initial_sl_price),
+                    "t1_lvl": _clean_float(t1_target_price),
+                    "t2_lvl": _clean_float(t2_target_price),
+                    "alt_tp": _clean_float(alt_tp_price),
+                    "alt_sl": _clean_float(alt_sl_price),
+                    "outcome": res_type
                 })
-                if hit_tp:
-                    markers.append({"time": ts, "position": "aboveBar", "color": "#FFD600", "shape": "arrowDown", "text": f"L-TP (+${pnl:,.0f})"})
+                if hit_tp or total_pnl > 0:
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#FFD600",
+                        "shape": "arrowDown",
+                        "text": f"L-{res_type} (+${total_pnl:,.0f})"
+                    })
                     state = 1 if trend_long else (-1 if trend_short else 0)
                     watch_peak = c_high
                 else:
-                    markers.append({"time": ts, "position": "aboveBar", "color": "#FF1744", "shape": "arrowDown", "text": f"L-SL (-${abs(pnl):,.0f})"})
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": "#FF1744",
+                        "shape": "arrowDown",
+                        "text": f"L-SL (-${abs(total_pnl):,.0f})"
+                    })
                     state = 3 if trend_long else (-1 if trend_short else 0)
                     watch_peak = c_high
 
+        # ----------------------------------------------------------------------
+        # ACTIVE SHORT POSITION MANAGEMENT (WITH MULTI-TRANCHE SCALE-OUT LADDER)
+        # ----------------------------------------------------------------------
         elif state == -2:
+            do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
+            hit_sl = c_high >= sl_price
+
+            if do_ladder and not hit_sl and remaining_shares >= 3:
+                if scale_stage == 0 and c_low <= t1_target_price and t1_target_price > tp_price:
+                    qty1 = max(1, int(round(initial_shares * (t1_sell_pct / 100.0))))
+                    qty1 = min(qty1, remaining_shares - 1)
+                    if qty1 > 0:
+                        part_pnl = (entry_price - t1_target_price) * qty1
+                        realized_trade_pnl += part_pnl
+                        _set_active_pool_cash(_get_active_pool_cash() + (qty1 * entry_price) + part_pnl)
+                        remaining_shares -= qty1
+                        reserved_cash = remaining_shares * entry_price
+                        scale_stage = 1
+                        sl_price = min(sl_price, entry_price)
+                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "belowBar",
+                            "color": "#80D8FF",
+                            "shape": "circle",
+                            "text": f"T1 COVER {qty1}sh (+${part_pnl:,.0f})"
+                        })
+
+                if scale_stage == 1 and c_low <= t2_target_price and t2_target_price > tp_price and remaining_shares >= 2:
+                    qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
+                    qty2 = min(qty2, remaining_shares - 1)
+                    if qty2 > 0:
+                        part_pnl = (entry_price - t2_target_price) * qty2
+                        realized_trade_pnl += part_pnl
+                        _set_active_pool_cash(_get_active_pool_cash() + (qty2 * entry_price) + part_pnl)
+                        remaining_shares -= qty2
+                        reserved_cash = remaining_shares * entry_price
+                        scale_stage = 2
+                        sl_price = min(sl_price, t1_target_price)
+                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
+                        markers.append({
+                            "time": ts,
+                            "position": "belowBar",
+                            "color": "#40C4FF",
+                            "shape": "circle",
+                            "text": f"T2 COVER {qty2}sh (+${part_pnl:,.0f})"
+                        })
+
             hit_tp = c_low <= tp_price
             hit_sl = c_high >= sl_price
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
-                pnl = (entry_price - exit_price) * position_shares
-                ret_pct = ((entry_price - exit_price) / max(entry_price, 1e-6)) * 100.0
-                pos_val = entry_price * position_shares
-                alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
-                equity += pnl
+                rem_pnl = (entry_price - exit_price) * remaining_shares
+                _set_active_pool_cash(_get_active_pool_cash() + (remaining_shares * entry_price) + rem_pnl)
+                total_pnl = realized_trade_pnl + rem_pnl
+                pos_val = entry_price * initial_shares
+                ret_pct = (total_pnl / max(pos_val, 1e-6)) * 100.0
+
+                remaining_shares = 0
+                reserved_cash = 0.0
+                state = 0
+                cur_eq = _total_portfolio_equity(c_close)
+                alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
+
+                res_type = "TP" if hit_tp else ("TRAIL-WIN" if total_pnl > 0 else "SL")
+                ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
 
                 trades.append({
                     "trade_no": len(trades) + 1,
                     "side": "SHORT",
                     "signal_type": entry_signal_reason,
                     "pool": pool_label,
+                    "entry_bar_idx": int(entry_idx),
+                    "exit_bar_idx": int(i),
                     "entry_time": timestamps[entry_idx],
                     "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
                     "exit_time": ts,
                     "exit_dt": _fmt_dt(dt_index[i], tf),
-                    "type": "TP" if hit_tp else "SL",
+                    "type": res_type,
                     "entry_price": _clean_float(entry_price, 0.0, 2),
                     "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(sl_price, 0.0, 2),
+                    "sl_price": _clean_float(initial_sl_price, 0.0, 2),
                     "tp_price": _clean_float(tp_price, 0.0, 2),
-                    "shares": int(position_shares),
+                    "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+                    "scale_summary": ladder_str,
+                    "shares": int(initial_shares),
                     "position_value": _clean_float(pos_val, 0.0, 2),
                     "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
                     "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
                     "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
                     "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(pnl, 0.0, 2),
+                    "pnl": _clean_float(total_pnl, 0.0, 2),
                     "ret_pct": _clean_float(ret_pct, 0.0, 2),
-                    "equity_after": _clean_float(equity, initial_capital, 2)
+                    "equity_after": _clean_float(cur_eq, initial_capital, 2)
                 })
                 boxes.append({
-                    "side": "SHORT", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price), "sl": _clean_float(sl_price),
-                    "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price),
-                    "outcome": "TP" if hit_tp else "SL"
+                    "trade_no": len(trades),
+                    "side": "SHORT",
+                    "t1": timestamps[entry_idx],
+                    "t2": ts,
+                    "entry": _clean_float(entry_price),
+                    "tp": _clean_float(tp_price),
+                    "sl": _clean_float(initial_sl_price),
+                    "t1_lvl": _clean_float(t1_target_price),
+                    "t2_lvl": _clean_float(t2_target_price),
+                    "alt_tp": _clean_float(alt_tp_price),
+                    "alt_sl": _clean_float(alt_sl_price),
+                    "outcome": res_type
                 })
-                if hit_tp:
-                    markers.append({"time": ts, "position": "belowBar", "color": "#FFD600", "shape": "arrowUp", "text": f"S-TP (+${pnl:,.0f})"})
+                if hit_tp or total_pnl > 0:
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#FFD600",
+                        "shape": "arrowUp",
+                        "text": f"S-{res_type} (+${total_pnl:,.0f})"
+                    })
                     state = -1 if trend_short else (1 if trend_long else 0)
                     watch_trough = c_low
                 else:
-                    markers.append({"time": ts, "position": "belowBar", "color": "#FF1744", "shape": "arrowUp", "text": f"S-SL (-${abs(pnl):,.0f})"})
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "color": "#FF1744",
+                        "shape": "arrowUp",
+                        "text": f"S-SL (-${abs(total_pnl):,.0f})"
+                    })
                     state = -3 if trend_short else (1 if trend_long else 0)
                     watch_trough = c_low
 
-        peak_equity = max(peak_equity, equity)
-        dd = ((peak_equity - equity) / max(peak_equity, 1.0)) * 100.0
+        live_eq = _total_portfolio_equity(c_close)
+        peak_equity = max(peak_equity, live_eq)
+        dd = ((peak_equity - live_eq) / max(peak_equity, 1.0)) * 100.0
         max_dd_pct = max(max_dd_pct, dd)
-        equity_curve.append({"time": ts, "value": _clean_float(equity, initial_capital, 2)})
+        equity_curve.append({"time": ts, "value": _clean_float(live_eq, initial_capital, 2)})
 
-    if state in [2, -2] and n > 0:
+    # If a trade is still open on the final bar
+    if state in [2, -2] and n > 0 and remaining_shares > 0:
         is_long_open = (state == 2)
         last_c = closes[-1]
-        unreal_pnl = ((last_c - entry_price) if is_long_open else (entry_price - last_c)) * position_shares
-        unreal_pct = (((last_c - entry_price) if is_long_open else (entry_price - last_c)) / max(entry_price, 1e-6)) * 100.0
-        pos_val = entry_price * position_shares
-        alloc_pct = (pos_val / max(equity, 1.0)) * 100.0
+        rem_unreal = ((last_c - entry_price) if is_long_open else (entry_price - last_c)) * remaining_shares
+        total_open_pnl = realized_trade_pnl + rem_unreal
+        pos_val = entry_price * initial_shares
+        unreal_pct = (total_open_pnl / max(pos_val, 1e-6)) * 100.0
+        final_eq = _total_portfolio_equity(last_c)
+        alloc_pct = (pos_val / max(final_eq, 1.0)) * 100.0
+        ladder_str = (" -> ".join(scale_notes) + f" ({remaining_shares}sh open)") if scale_notes else f"OPEN ({remaining_shares}sh)"
 
         trades.append({
             "trade_no": len(trades) + 1,
             "side": "LONG" if is_long_open else "SHORT",
             "signal_type": entry_signal_reason,
             "pool": pool_label,
+            "entry_bar_idx": int(entry_idx),
+            "exit_bar_idx": int(n - 1),
             "entry_time": timestamps[entry_idx],
             "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
             "exit_time": timestamps[-1],
@@ -1031,42 +1335,48 @@ def run_strategy_backtest(
             "type": "OPEN",
             "entry_price": _clean_float(entry_price, 0.0, 2),
             "exit_price": _clean_float(last_c, 0.0, 2),
-            "sl_price": _clean_float(sl_price, 0.0, 2),
+            "sl_price": _clean_float(initial_sl_price, 0.0, 2),
             "tp_price": _clean_float(tp_price, 0.0, 2),
-            "shares": int(position_shares),
+            "dyn_mults": f"{entry_sl_mult_used:.2f}x / {entry_tp_mult_used:.2f}x",
+            "scale_summary": ladder_str,
+            "shares": int(initial_shares),
             "position_value": _clean_float(pos_val, 0.0, 2),
             "alloc_pct": _clean_float(alloc_pct, 0.0, 1),
             "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
             "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)),
             "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-            "pnl": _clean_float(unreal_pnl, 0.0, 2),
+            "pnl": _clean_float(total_open_pnl, 0.0, 2),
             "ret_pct": _clean_float(unreal_pct, 0.0, 2),
-            "equity_after": _clean_float(equity + unreal_pnl, initial_capital, 2)
+            "equity_after": _clean_float(final_eq, initial_capital, 2)
         })
-
         boxes.append({
+            "trade_no": len(trades),
             "side": "LONG" if is_long_open else "SHORT",
             "t1": timestamps[entry_idx],
             "t2": timestamps[-1],
             "entry": _clean_float(entry_price),
             "tp": _clean_float(tp_price),
-            "sl": _clean_float(sl_price),
+            "sl": _clean_float(initial_sl_price),
+            "t1_lvl": _clean_float(t1_target_price),
+            "t2_lvl": _clean_float(t2_target_price),
             "alt_tp": _clean_float(alt_tp_price),
             "alt_sl": _clean_float(alt_sl_price),
             "outcome": "ACTIVE"
         })
 
-    closed_trades = [t for t in trades if t["type"] in ["TP", "SL"]]
+    final_mark_equity = _total_portfolio_equity(closes[-1]) if n > 0 else initial_capital
+    closed_trades = [t for t in trades if t["type"] in ["TP", "TRAIL-WIN", "SL"]]
     total_trades = len(closed_trades)
     long_trades = sum(1 for t in closed_trades if t.get("side") == "LONG")
     short_trades = sum(1 for t in closed_trades if t.get("side") == "SHORT")
     wins = [t for t in closed_trades if t['pnl'] > 0]
     losses = [t for t in closed_trades if t['pnl'] <= 0]
     win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
+
     gross_profit = sum(t['pnl'] for t in wins)
     gross_loss = abs(sum(t['pnl'] for t in losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
-    net_return_pct = ((equity - initial_capital) / max(initial_capital, 1.0)) * 100.0
+    net_return_pct = ((final_mark_equity - initial_capital) / max(initial_capital, 1.0)) * 100.0
     buy_hold_ret = ((closes[-1] - closes[0]) / max(closes[0], 1e-6)) * 100.0 if n > 1 else 0.0
 
     stats = {
@@ -1074,8 +1384,10 @@ def run_strategy_backtest(
         "strategy_name": STRATEGY_METADATA[strategy_key]["name"],
         "bucket": STRATEGY_METADATA[strategy_key]["bucket"],
         "initial_capital": _clean_float(initial_capital, 100000.0, 2),
-        "ending_equity": _clean_float(equity, initial_capital, 2),
-        "net_pnl": _clean_float(equity - initial_capital, 0.0, 2),
+        "ending_equity": _clean_float(final_mark_equity, initial_capital, 2),
+        "core_cash_end": _clean_float(core_cash, initial_capital * core_pct, 2),
+        "intraday_cash_end": _clean_float(intraday_cash, initial_capital * intraday_pct, 2),
+        "net_pnl": _clean_float(final_mark_equity - initial_capital, 0.0, 2),
         "net_return_pct": _clean_float(net_return_pct, 0.0, 2),
         "buy_hold_pct": _clean_float(buy_hold_ret, 0.0, 2),
         "total_trades": total_trades,
@@ -1099,7 +1411,13 @@ def run_strategy_backtest(
 # 4. BLACK-SCHOLES GREEKS & YAHOO LIVE OPTION CHAIN + CONTRACT HISTORY ENGINE
 # ==============================================================================
 def black_scholes_analysis(
-    S: float, K: float, days_to_expiry: int, iv_pct: float, r_pct: float, gk_daily_vol_pct: float, opt_type: str = "call"
+    S: float,
+    K: float,
+    days_to_expiry: int,
+    iv_pct: float,
+    r_pct: float,
+    gk_daily_vol_pct: float,
+    opt_type: str = "call"
 ) -> Dict[str, Any]:
     S = max(_clean_float(S, 100.0), 0.01)
     K = max(_clean_float(K, 100.0), 0.01)
@@ -1107,7 +1425,6 @@ def black_scholes_analysis(
     sigma = max(_clean_float(iv_pct, 50.0) / 100.0, 0.01)
     r = _clean_float(r_pct, 4.25) / 100.0
     gk_daily = max(_clean_float(gk_daily_vol_pct, 2.0), 0.1)
-
     hv_annual = (gk_daily / 100.0) * math.sqrt(252)
 
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
@@ -1128,7 +1445,6 @@ def black_scholes_analysis(
 
     gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
     vega = (S * norm.pdf(d1) * math.sqrt(T)) / 100.0
-
     expected_move_iv_dollar = S * sigma * math.sqrt(T)
     expected_move_hv_dollar = S * hv_annual * math.sqrt(T)
     iv_hv_ratio = sigma / max(hv_annual, 0.01)
@@ -1232,25 +1548,30 @@ def api_option_chain(
         ymd = sel_exp.replace("-", "")[2:]
         c_sym = f"{ticker}{ymd}C{int(k*1000):08d}"
         p_sym = f"{ticker}{ymd}P{int(k*1000):08d}"
-
         calls.append({
-            "contractSymbol": c_sym, "strike": k,
+            "contractSymbol": c_sym,
+            "strike": k,
             "lastPrice": _clean_float(bs_c["theo_price"], 0.01, 2),
             "bid": _clean_float(max(0.01, bs_c["theo_price"] * 0.96), 0.01, 2),
             "ask": _clean_float(bs_c["theo_price"] * 1.04, 0.02, 2),
             "iv_pct": _clean_float(skew_iv, 50.0, 1),
-            "volume": 120 * (6 - abs(k_idx)), "openInterest": 850 * (6 - abs(k_idx)),
-            "delta": bs_c["delta"], "theta": bs_c["theta_daily"],
+            "volume": 120 * (6 - abs(k_idx)),
+            "openInterest": 850 * (6 - abs(k_idx)),
+            "delta": bs_c["delta"],
+            "theta": bs_c["theta_daily"],
             "verdict": "CHEAP" if bs_c["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_c["iv_hv_ratio"] > 1.25 else "FAIR")
         })
         puts.append({
-            "contractSymbol": p_sym, "strike": k,
+            "contractSymbol": p_sym,
+            "strike": k,
             "lastPrice": _clean_float(bs_p["theo_price"], 0.01, 2),
             "bid": _clean_float(max(0.01, bs_p["theo_price"] * 0.96), 0.01, 2),
             "ask": _clean_float(bs_p["theo_price"] * 1.04, 0.02, 2),
             "iv_pct": _clean_float(skew_iv, 50.0, 1),
-            "volume": 95 * (6 - abs(k_idx)), "openInterest": 720 * (6 - abs(k_idx)),
-            "delta": bs_p["delta"], "theta": bs_p["theta_daily"],
+            "volume": 95 * (6 - abs(k_idx)),
+            "openInterest": 720 * (6 - abs(k_idx)),
+            "delta": bs_p["delta"],
+            "theta": bs_p["theta_daily"],
             "verdict": "CHEAP" if bs_p["iv_hv_ratio"] < 0.9 else ("EXPENSIVE" if bs_p["iv_hv_ratio"] > 1.25 else "FAIR")
         })
 
@@ -1304,6 +1625,7 @@ def api_option_contract_history(
             "low": _clean_float(max(0.01, bs["theo_price"] * 0.92), 0.01, 2),
             "volume": int(max(10, _clean_float(r["volume"], 1000) / 5000))
         })
+
     return _sanitize_for_json({
         "contract": contract_symbol,
         "source": "Historical Black-Scholes Reconstructed Curve (Underlying-Linked)",
@@ -1324,7 +1646,13 @@ def api_analyze(
     trade_side: str = Query("both"),
     sl_mult: float = Query(1.5),
     tp_mult: float = Query(3.0),
+    dynamic_tpsl: bool = Query(True),
     vol_model: str = Query("atr"),
+    enable_scale_out: bool = Query(True),
+    t1_gain_pct: float = Query(4.0),
+    t1_sell_pct: float = Query(35.0),
+    t2_gain_pct: float = Query(8.0),
+    t2_sell_pct: float = Query(35.0),
     w_trend: float = Query(0.4),
     w_liq: float = Query(0.4),
     w_rev: float = Query(0.2),
@@ -1366,7 +1694,8 @@ def api_analyze(
         df_calc = df_raw.copy()
 
     df_ind, unavailable_list = compute_all_indicators(
-        df_calc, tf, atr_mult=sl_mult, gk_mult=tp_mult, w_trend=w_trend, w_liq=w_liq, w_rev=w_rev
+        df_calc, tf, atr_mult=sl_mult, gk_mult=tp_mult, dynamic_tpsl=dynamic_tpsl,
+        w_trend=w_trend, w_liq=w_liq, w_rev=w_rev
     )
 
     if start_ts is not None:
@@ -1378,35 +1707,26 @@ def api_analyze(
         df_view = df_ind.copy()
 
     bt_selected = run_strategy_backtest(
-        df_view,
-        tf=tf,
-        strategy_key=strategy,
-        trade_side=trade_side,
-        sl_mult=sl_mult,
-        tp_mult=tp_mult,
-        vol_model=vol_model,
-        initial_capital=initial_capital,
-        core_pct=core_pct / 100.0,
-        intraday_pct=intraday_pct / 100.0,
-        risk_per_trade_pct=risk_pct / 100.0,
-        manual_entry_ts=manual_entry_ts,
-        manual_side=manual_side
+        df_view, tf=tf, strategy_key=strategy, trade_side=trade_side,
+        sl_mult=sl_mult, tp_mult=tp_mult, vol_model=vol_model,
+        enable_scale_out=enable_scale_out,
+        t1_gain_pct=t1_gain_pct, t1_sell_pct=t1_sell_pct,
+        t2_gain_pct=t2_gain_pct, t2_sell_pct=t2_sell_pct,
+        initial_capital=initial_capital, core_pct=core_pct / 100.0,
+        intraday_pct=intraday_pct / 100.0, risk_per_trade_pct=risk_pct / 100.0,
+        manual_entry_ts=manual_entry_ts, manual_side=manual_side
     )
 
     all_summary = []
     for s_key in STRATEGY_METADATA.keys():
         res = run_strategy_backtest(
-            df_view,
-            tf=tf,
-            strategy_key=s_key,
-            trade_side=trade_side,
-            sl_mult=sl_mult,
-            tp_mult=tp_mult,
-            vol_model=vol_model,
-            initial_capital=initial_capital,
-            core_pct=core_pct / 100.0,
-            intraday_pct=intraday_pct / 100.0,
-            risk_per_trade_pct=risk_pct / 100.0,
+            df_view, tf=tf, strategy_key=s_key, trade_side=trade_side,
+            sl_mult=sl_mult, tp_mult=tp_mult, vol_model=vol_model,
+            enable_scale_out=enable_scale_out,
+            t1_gain_pct=t1_gain_pct, t1_sell_pct=t1_sell_pct,
+            t2_gain_pct=t2_gain_pct, t2_sell_pct=t2_sell_pct,
+            initial_capital=initial_capital, core_pct=core_pct / 100.0,
+            intraday_pct=intraday_pct / 100.0, risk_per_trade_pct=risk_pct / 100.0,
             manual_entry_ts=manual_entry_ts if s_key == "plain_tpsl" else None,
             manual_side=manual_side
         )
@@ -1423,11 +1743,10 @@ def api_analyze(
     }
     fvg_boxes = []
     unclear_spans = []
-
     in_unclear = False
     unclear_start = None
-    idx_timestamps = [int(t.timestamp()) for t in df_view.index]
 
+    idx_timestamps = [int(t.timestamp()) for t in df_view.index]
     is_intraday_strat = strategy in ["orb", "do_t", "smc_fvg"]
     pool_frac = (intraday_pct / 100.0) if is_intraday_strat else (core_pct / 100.0)
     risk_frac = risk_pct / 100.0
@@ -1441,11 +1760,14 @@ def api_analyze(
         v_val = _clean_float(row['volume'], 0.0)
         atr_val = _clean_float(row['atr'], max(c_val * 0.015, 0.01))
         gk_val = _clean_float(row['gk_sigma_dollar'], atr_val)
+        d_sl = _clean_float(row['dyn_sl_mult'], sl_mult, 2)
+        d_tp = _clean_float(row['dyn_tp_mult'], tp_mult, 2)
+
         unit_v = gk_val if vol_model == "gk" else atr_val
         if unit_v <= 0:
             unit_v = max(c_val * 0.015, 0.01)
 
-        stop_dist = max(sl_mult * unit_v, c_val * 0.005, 0.01)
+        stop_dist = max(d_sl * unit_v, c_val * 0.004, 0.01)
         risk_dollars = initial_capital * risk_frac
         max_pool_dollars = initial_capital * pool_frac
         raw_sh = min(risk_dollars / stop_dist, max_pool_dollars / max(c_val, 0.01))
@@ -1477,6 +1799,8 @@ def api_analyze(
             "atr": _clean_float(atr_val, 0.0, 2),
             "gk_pct": _clean_float(float(row['gk_vol_pct']) * 100.0, 2.0, 2),
             "score": _clean_float(row['composite_score'], 0.0, 2),
+            "dyn_sl_mult": d_sl,
+            "dyn_tp_mult": d_tp,
             "regime": "UNCLEAR / VOLATILE" if bool(row['is_unclear_volatile']) else (
                 "BULL TREND" if _clean_float(row['ema20']) >= _clean_float(row['ema50']) else "BEAR TREND"
             ),
@@ -1484,9 +1808,9 @@ def api_analyze(
             "sug_pos_val": sug_pos_val,
             "sug_risk": sug_risk_dlr,
             "long_sl": _clean_float(c_val - stop_dist, 0.0, 2),
-            "long_tp": _clean_float(c_val + tp_mult * unit_v, 0.0, 2),
+            "long_tp": _clean_float(c_val + d_tp * unit_v, 0.0, 2),
             "short_sl": _clean_float(c_val + stop_dist, 0.0, 2),
-            "short_tp": _clean_float(c_val - tp_mult * unit_v, 0.0, 2)
+            "short_tp": _clean_float(c_val - d_tp * unit_v, 0.0, 2)
         }
 
         for col in series_data.keys():
@@ -1500,8 +1824,10 @@ def api_analyze(
             if not pd.isna(top_v) and not pd.isna(bot_v):
                 t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
                 fvg_boxes.append({
-                    "t1": idx_timestamps[i - 2], "t2": t_end,
-                    "top": _clean_float(top_v), "bot": _clean_float(bot_v),
+                    "t1": idx_timestamps[i - 2],
+                    "t2": t_end,
+                    "top": _clean_float(top_v),
+                    "bot": _clean_float(bot_v),
                     "kind": "BULL_FVG"
                 })
         if bool(row['fvg_bear']) and i >= 2:
@@ -1510,8 +1836,10 @@ def api_analyze(
             if not pd.isna(top_v) and not pd.isna(bot_v):
                 t_end = idx_timestamps[min(i + 8, len(idx_timestamps) - 1)]
                 fvg_boxes.append({
-                    "t1": idx_timestamps[i - 2], "t2": t_end,
-                    "top": _clean_float(top_v), "bot": _clean_float(bot_v),
+                    "t1": idx_timestamps[i - 2],
+                    "t2": t_end,
+                    "top": _clean_float(top_v),
+                    "bot": _clean_float(bot_v),
                     "kind": "BEAR_FVG"
                 })
 
@@ -1522,7 +1850,6 @@ def api_analyze(
         elif not is_unc and in_unclear:
             in_unclear = False
             unclear_spans.append({"t1": unclear_start, "t2": ts})
-
     if in_unclear and unclear_start is not None:
         unclear_spans.append({"t1": unclear_start, "t2": idx_timestamps[-1]})
 
@@ -1553,7 +1880,9 @@ def api_analyze(
             "close": last_close,
             "atr": last_atr,
             "gk_daily_vol_pct": last_gk_pct,
-            "composite_score": _clean_float(last_row['composite_score'], 0.0, 2)
+            "composite_score": _clean_float(last_row['composite_score'], 0.0, 2),
+            "dyn_sl_mult": _clean_float(last_row['dyn_sl_mult'], sl_mult, 2),
+            "dyn_tp_mult": _clean_float(last_row['dyn_tp_mult'], tp_mult, 2)
         }
     }
     return JSONResponse(content=_sanitize_for_json(payload))
@@ -1576,14 +1905,14 @@ def api_options_greeks(
 
 
 # ==============================================================================
-# 6. FRONTEND SINGLE-PAGE APPLICATION (HOVER HUD + TRADE LOG + FOLDABLE UI)
+# 6. FRONTEND SINGLE-PAGE APPLICATION (SMART TRADE ZOOM + SCALE LADDER + DYNAMIC SL/TP)
 # ==============================================================================
 HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Quant Strategy, Hover Sizing HUD & Trade Log Terminal</title>
+<title>Quant Strategy: Dynamic SL/TP, Scale-Out Ladder & Smart Trade Zoom</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -1599,9 +1928,9 @@ HTML_PAGE = r"""
   }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; font-size: 13px; }
-  
+
   .sidebar {
-    width: 340px; background: var(--panel); border-right: 1px solid var(--border);
+    width: 350px; background: var(--panel); border-right: 1px solid var(--border);
     overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px;
     transition: width 0.2s ease, padding 0.2s ease; flex-shrink: 0;
   }
@@ -1616,9 +1945,7 @@ HTML_PAGE = r"""
     justify-content: space-between; align-items: center; user-select: none;
   }
   details.fold-card > summary::-webkit-details-marker { display: none; }
-  details.fold-card > summary::after {
-    content: "▼"; font-size: 10px; color: var(--muted); transition: transform 0.15s ease;
-  }
+  details.fold-card > summary::after { content: "▼"; font-size: 10px; color: var(--muted); transition: transform 0.15s ease; }
   details.fold-card:not([open]) > summary::after { transform: rotate(-90deg); }
   details.fold-card[open] > summary { margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
 
@@ -1629,19 +1956,16 @@ HTML_PAGE = r"""
   }
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
-  
   .chk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 4px; }
   .chk-item { display: flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer; }
-  
   button.btn {
     background: var(--accent); color: #fff; border: none; border-radius: 4px;
     padding: 6px 10px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 8px; font-size: 12px;
   }
   button.btn:hover { opacity: 0.9; }
   button.btn-sec { background: #2a2e39; color: var(--text); }
-  
+
   .main { flex: 1; display: flex; flex-direction: column; height: 100vh; overflow-y: auto; }
-  
   .topbar {
     background: var(--panel); border-bottom: 1px solid var(--border); padding: 6px 12px;
     display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0;
@@ -1656,13 +1980,11 @@ HTML_PAGE = r"""
   .breadcrumbs { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .crumb {
     background: #1e2433; border: 1px solid #363c4e; color: var(--text);
-    padding: 3px 8px; border-radius: 4px; font-size: 11px; display: inline-flex;
-    align-items: center; gap: 6px; cursor: pointer;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
   }
   .crumb.active { background: var(--accent); border-color: var(--accent); font-weight: 700; }
   .crumb-close {
-    font-weight: bold; color: #ff8a80; cursor: pointer; padding: 0 3px; border-radius: 3px;
-    font-size: 12px; line-height: 1;
+    font-weight: bold; color: #ff8a80; cursor: pointer; padding: 0 3px; border-radius: 3px; font-size: 12px; line-height: 1;
   }
   .crumb-close:hover { background: rgba(255, 23, 68, 0.35); color: #fff; }
   .crumb-clear {
@@ -1676,47 +1998,39 @@ HTML_PAGE = r"""
     padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600;
   }
   .tf-btn.active { background: #00b0ff; color: #000; border-color: #00b0ff; }
-  
+
   .alert-banner {
     background: rgba(255, 152, 0, 0.15); border-bottom: 1px solid #ff9800;
     color: #ffb74d; padding: 5px 14px; font-size: 11.5px; display: none; flex-shrink: 0;
   }
 
-  .chart-wrapper {
-    position: relative; width: 100%; flex: 1; min-height: 440px;
-    background: #0b0e14; border-bottom: 1px solid var(--border);
-  }
+  .chart-wrapper { position: relative; width: 100%; flex: 1; min-height: 440px; background: #0b0e14; border-bottom: 1px solid var(--border); }
   #tv-chart { width: 100%; height: 100%; }
   #overlay-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
   .chart-legend {
-    position: absolute; top: 10px; left: 14px; z-index: 20; background: rgba(19, 23, 34, 0.88);
-    padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45;
+    position: absolute; top: 10px; left: 14px; z-index: 20;
+    background: rgba(19, 23, 34, 0.88); padding: 6px 10px; border-radius: 4px;
+    border: 1px solid var(--border); pointer-events: none; font-size: 11px; line-height: 1.45;
   }
-
   .floating-hud {
-    position: absolute; top: 10px; right: 72px; z-index: 25;
-    width: 300px; background: rgba(15, 19, 28, 0.94);
-    border: 1px solid #363c4e; border-radius: 6px; padding: 9px 11px;
-    pointer-events: none; font-size: 11px; line-height: 1.45;
+    position: absolute; top: 10px; right: 72px; z-index: 25; width: 315px;
+    background: rgba(15, 19, 28, 0.94); border: 1px solid #363c4e; border-radius: 6px;
+    padding: 9px 11px; pointer-events: none; font-size: 11px; line-height: 1.45;
     box-shadow: 0 6px 18px rgba(0,0,0,0.5); display: none;
   }
-  .hud-header {
-    font-weight: 700; font-size: 11.5px; color: #00b0ff; border-bottom: 1px solid var(--border);
-    padding-bottom: 4px; margin-bottom: 5px; display: flex; justify-content: space-between;
-  }
+  .hud-header { font-weight: 700; font-size: 11.5px; color: #00b0ff; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-bottom: 5px; display: flex; justify-content: space-between; }
   .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 10px; }
-  .hud-size-box {
-    margin-top: 6px; padding-top: 5px; border-top: 1px dashed #363c4e;
-    color: #ffd600; font-size: 11px;
-  }
+  .hud-size-box { margin-top: 6px; padding-top: 5px; border-top: 1px dashed #363c4e; color: #ffd600; font-size: 11px; }
 
   .bottom-panels { padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
   .bottom-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
+
   table { width: 100%; border-collapse: collapse; font-size: 11px; }
   th, td { padding: 5px 7px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--muted); font-weight: 600; background: #161b26; position: sticky; top: 0; z-index: 2; }
-  tr.highlight-row { background: rgba(41, 98, 255, 0.18); font-weight: 600; }
-  tr:hover { background: rgba(255, 255, 255, 0.04); }
+  tr.highlight-row { background: rgba(41, 98, 255, 0.22); font-weight: 600; }
+  tr.selected-trade-row { background: rgba(0, 176, 255, 0.28) !important; outline: 1px solid #00b0ff; }
+  tr:hover { background: rgba(255, 255, 255, 0.05); }
   .pos { color: var(--green); }
   .neg { color: var(--red); }
   .pill { padding: 2px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; }
@@ -1729,6 +2043,7 @@ HTML_PAGE = r"""
 
 <!-- ==================== FOLDABLE LEFT SIDEBAR ==================== -->
 <div class="sidebar" id="sidebar">
+
   <details class="fold-card" open>
     <summary>1. Asset, Side & Click Action</summary>
     <div class="row-2">
@@ -1754,12 +2069,12 @@ HTML_PAGE = r"""
     </select>
     <div class="row-2" style="margin-top:4px;">
       <button class="btn" onclick="resetToRoot()">Load Max History</button>
-      <button class="btn btn-sec" onclick="clearCutoffAndManual()">Reset Cutoff/Manual</button>
+      <button class="btn btn-sec" onclick="clearCutoffAndManual()">Reset Zoom/Cutoff</button>
     </div>
   </details>
 
   <details class="fold-card" open>
-    <summary>2. Strategy & Auto-Indicators</summary>
+    <summary>2. Strategy & Dynamic SL/TP Formula</summary>
     <label>Active Strategy</label>
     <select id="strategy" onchange="onStrategyChange()">
       <option value="trend">1. Core Trend (EMA 20/50 + Volume L/S)</option>
@@ -1769,24 +2084,35 @@ HTML_PAGE = r"""
       <option value="orb">5. Opening Range Breakout/Breakdown (ORB)</option>
       <option value="do_t">6. Intraday 'Do T' (VWAP +-2 Sigma L/S)</option>
       <option value="composite">7. Composite Score (a*A + b*B + c*C)</option>
-      <option value="plain_tpsl">8. Plain TP/SL & Manual Click Sandbox</option>
+      <option value="scale_ladder">8. Momentum Scale-Out Ladder (Sell xx% @ +xx%)</option>
+      <option value="plain_tpsl">9. Plain TP/SL & Manual Click Sandbox</option>
     </select>
 
-    <div class="row-3" style="margin-top:6px;">
+    <div class="row-2" style="margin-top:6px;">
       <div>
-        <label>SL Mult</label>
-        <input type="number" id="sl_mult" value="1.5" step="0.25">
+        <label>SL/TP Mode</label>
+        <select id="dynamic_tpsl" onchange="loadChartData()">
+          <option value="true" selected>Dynamic Formula (Regime+Vol)</option>
+          <option value="false">Fixed Multipliers</option>
+        </select>
       </div>
       <div>
-        <label>TP Mult</label>
-        <input type="number" id="tp_mult" value="3.0" step="0.25">
-      </div>
-      <div>
-        <label>Band Model</label>
-        <select id="vol_model">
+        <label>Band Volatility Model</label>
+        <select id="vol_model" onchange="loadChartData()">
           <option value="atr">ATR (14)</option>
           <option value="gk">Garman-Klass</option>
         </select>
+      </div>
+    </div>
+
+    <div class="row-2" style="margin-top:4px;">
+      <div>
+        <label>Base SL Mult (Anchor)</label>
+        <input type="number" id="sl_mult" value="1.5" step="0.25">
+      </div>
+      <div>
+        <label>Base TP Mult (Anchor)</label>
+        <input type="number" id="tp_mult" value="2.8" step="0.25">
       </div>
     </div>
 
@@ -1796,28 +2122,42 @@ HTML_PAGE = r"""
       <div><label>b (Liquid)</label><input type="number" id="w_liq" value="0.4" step="0.1"></div>
       <div><label>g (VWAP)</label><input type="number" id="w_rev" value="0.2" step="0.1"></div>
     </div>
-    <button class="btn" onclick="loadChartData()">Apply Parameters</button>
+    <button class="btn" onclick="loadChartData()">Apply Strategy & Formula</button>
   </details>
 
   <details class="fold-card" open>
-    <summary>3. Selectable Overlays & Zones</summary>
-    <div class="chk-grid">
-      <label class="chk-item"><input type="checkbox" id="chk_ema20" checked onchange="renderOverlays()"> EMA 20 & 50</label>
-      <label class="chk-item"><input type="checkbox" id="chk_vwap" onchange="renderOverlays()"> Session VWAP</label>
-      <label class="chk-item"><input type="checkbox" id="chk_vwap_bands" onchange="renderOverlays()"> VWAP +-2s Bands</label>
-      <label class="chk-item"><input type="checkbox" id="chk_atr_bands" checked onchange="renderOverlays()"> ATR Interval</label>
-      <label class="chk-item"><input type="checkbox" id="chk_gk_bands" checked onchange="renderOverlays()"> Garman-Klass Cone</label>
-      <label class="chk-item"><input type="checkbox" id="chk_fib_levels" onchange="renderOverlays()"> Fibonacci Levels</label>
-      <label class="chk-item"><input type="checkbox" id="chk_orb_levels" onchange="renderOverlays()"> ORB High/Low</label>
-      <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> SMC FVG Boxes</label>
-      <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
-      <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
-      <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating Hover HUD</label>
+    <summary>3. Scale-Out Profit Ladder (All Strategies)</summary>
+    <label class="chk-item" style="margin-bottom:6px; color:#00e676; font-weight:600;">
+      <input type="checkbox" id="enable_scale_out" checked onchange="loadChartData()">
+      Apply Multi-Tranche Scale-Out to Every Strategy
+    </label>
+    <div class="row-2">
+      <div>
+        <label>Tier 1 Trigger (+Gain %)</label>
+        <input type="number" id="t1_gain_pct" value="4.0" step="0.5" onchange="loadChartData()">
+      </div>
+      <div>
+        <label>Tier 1 Sell (% Shares)</label>
+        <input type="number" id="t1_sell_pct" value="35" step="5" onchange="loadChartData()">
+      </div>
+    </div>
+    <div class="row-2">
+      <div>
+        <label>Tier 2 Trigger (+Gain %)</label>
+        <input type="number" id="t2_gain_pct" value="8.0" step="0.5" onchange="loadChartData()">
+      </div>
+      <div>
+        <label>Tier 2 Sell (% Shares)</label>
+        <input type="number" id="t2_sell_pct" value="35" step="5" onchange="loadChartData()">
+      </div>
+    </div>
+    <div style="font-size:10.5px; color:var(--muted); margin-top:5px;">
+      * Remaining shares ride to Dynamic TP with Stop-Loss ratcheted to Breakeven (at T1) and T1 Price (at T2).
     </div>
   </details>
 
   <details class="fold-card" open>
-    <summary>4. Portfolio & Position Sizing ($100k)</summary>
+    <summary>4. Dual-Pool Portfolio Control ($100k)</summary>
     <div class="row-2">
       <div>
         <label>Starting Capital ($)</label>
@@ -1825,7 +2165,7 @@ HTML_PAGE = r"""
       </div>
       <div>
         <label>Risk / Trade (%)</label>
-        <input type="number" id="risk_pct" value="1.0" step="0.25" onchange="loadChartData()">
+        <input type="number" id="risk_pct" value="1.25" step="0.25" onchange="loadChartData()">
       </div>
     </div>
     <div class="row-2">
@@ -1839,6 +2179,24 @@ HTML_PAGE = r"""
       </div>
     </div>
   </details>
+
+  <details class="fold-card">
+    <summary>5. Selectable Overlays & Zones</summary>
+    <div class="chk-grid">
+      <label class="chk-item"><input type="checkbox" id="chk_ema20" checked onchange="renderOverlays()"> EMA 20 & 50</label>
+      <label class="chk-item"><input type="checkbox" id="chk_vwap" onchange="renderOverlays()"> Session VWAP</label>
+      <label class="chk-item"><input type="checkbox" id="chk_vwap_bands" onchange="renderOverlays()"> VWAP +-2s Bands</label>
+      <label class="chk-item"><input type="checkbox" id="chk_atr_bands" checked onchange="renderOverlays()"> Dyn SL ATR Band</label>
+      <label class="chk-item"><input type="checkbox" id="chk_gk_bands" checked onchange="renderOverlays()"> Dyn TP GK Cone</label>
+      <label class="chk-item"><input type="checkbox" id="chk_fib_levels" onchange="renderOverlays()"> Fibonacci Levels</label>
+      <label class="chk-item"><input type="checkbox" id="chk_orb_levels" onchange="renderOverlays()"> ORB High/Low</label>
+      <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> SMC FVG Boxes</label>
+      <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
+      <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
+      <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating Hover HUD</label>
+    </div>
+  </details>
+
 </div>
 
 <!-- ==================== MAIN VIEWPORT ==================== -->
@@ -1847,6 +2205,7 @@ HTML_PAGE = r"""
     <div class="left-nav">
       <button class="toggle-btn" id="btn-sidebar" onclick="toggleSidebar()">◀ Hide Controls</button>
       <button class="toggle-btn" id="btn-panels" onclick="toggleAllPanels()">▼ Fold All Panels</button>
+      <button class="toggle-btn" onclick="fitFullChart()" title="Reset zoom to show all bars">🔍 Fit Full Chart</button>
       <div class="breadcrumbs" id="breadcrumb-bar"></div>
     </div>
     <div class="tf-selector" id="tf-buttons">
@@ -1873,10 +2232,11 @@ HTML_PAGE = r"""
 
   <!-- Foldable Bottom Panels -->
   <div class="bottom-panels">
+
     <!-- Panel A: Detailed Trade Execution Log -->
     <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
       <summary>
-        <span>Active Strategy Trade Execution Log & Position Sizing (Click Any Row to Jump to Trade on Chart)</span>
+        <span>Active Strategy Trade Execution Log & Scale-Out Ladder (Click Any Row to Smart-Zoom Trade on Chart)</span>
         <span id="trade-count-badge" style="color:#00e676; margin-right:10px;"></span>
       </summary>
       <div style="overflow-x:auto; max-height:195px;">
@@ -1885,20 +2245,21 @@ HTML_PAGE = r"""
             <tr>
               <th>#</th>
               <th>Side</th>
-              <th>Signal</th>
-              <th>Pool</th>
+              <th>Signal (Dyn SL/TP)</th>
+              <th>Bucket Pool</th>
               <th>Entry Time</th>
               <th>Entry $</th>
-              <th>Shares to Buy/Short</th>
-              <th>Position Value ($)</th>
-              <th>Dollar Risk ($)</th>
+              <th>Initial Shares</th>
+              <th>Position Value</th>
+              <th>Dollar Risk</th>
               <th>SL / TP ($)</th>
+              <th>Scale-Out Ladder</th>
               <th>Exit Time</th>
               <th>Exit $</th>
               <th>Result</th>
               <th>Net PnL ($)</th>
               <th>Return %</th>
-              <th>Account Equity</th>
+              <th>Total Equity</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -1910,7 +2271,7 @@ HTML_PAGE = r"""
       <!-- Panel B: All-Strategies Comparison -->
       <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
         <summary>
-          <span>All Strategies Comparison ($100k Baseline — Long & Short)</span>
+          <span>All Strategies Comparison ($100k Dual-Pool Baseline)</span>
           <span id="bh-badge" style="color:var(--gold); margin-right:10px;"></span>
         </summary>
         <div style="overflow-x:auto; max-height:190px;">
@@ -1986,6 +2347,7 @@ HTML_PAGE = r"""
         <div id="contract-hist-strip" style="display:flex; gap:6px; overflow-x:auto; padding-bottom:4px;"></div>
       </div>
     </details>
+
   </div>
 </div>
 
@@ -1993,12 +2355,13 @@ HTML_PAGE = r"""
 let chart, candleSeries, volumeSeries;
 let lineSeriesMap = {};
 let currentData = null;
-
 let currentTF = "1Y";
 let currentStartTs = null;
 let currentCutoffTs = null;
 let manualEntryTs = null;
 let manualSide = "long";
+let focusedTradeNo = null;
+
 let breadcrumbs = [{ label: "Max (1Y)", tf: "1Y", startTs: null }];
 let activeCrumbIdx = 0;
 let allPanelsFolded = false;
@@ -2021,6 +2384,16 @@ function toggleAllPanels() {
   setTimeout(resizeChart, 60);
 }
 
+function fitFullChart() {
+  focusedTradeNo = null;
+  document.querySelectorAll('#trade-log-table tbody tr').forEach(r => r.classList.remove('selected-trade-row'));
+  if (chart) {
+    chart.priceScale('right').applyOptions({ autoScale: true });
+    chart.timeScale().fitContent();
+    requestAnimationFrame(drawCanvasZones);
+  }
+}
+
 function resizeChart() {
   if (!chart) return;
   const wrap = document.getElementById('chart-wrap');
@@ -2034,7 +2407,7 @@ function initChart() {
     layout: { background: { type: 'solid', color: '#0b0e14' }, textColor: '#d1d4dc' },
     grid: { vertLines: { color: '#1a1f2e' }, horzLines: { color: '#1a1f2e' } },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: '#2a2e39' },
+    rightPriceScale: { borderColor: '#2a2e39', autoScale: true },
     timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false }
   });
 
@@ -2056,10 +2429,10 @@ function initChart() {
     vwap: { color: '#e040fb', lineWidth: 2, title: 'VWAP' },
     vwap_u2: { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP +2s' },
     vwap_l2: { color: 'rgba(224,64,251,0.5)', lineWidth: 1, lineStyle: 2, title: 'VWAP -2s' },
-    atr_upper: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'ATR Upper' },
-    atr_lower: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'ATR Lower' },
-    gk_upper: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'GK Cone Upper' },
-    gk_lower: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'GK Cone Lower' },
+    atr_upper: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'Dyn SL Upper' },
+    atr_lower: { color: 'rgba(0,229,255,0.6)', lineWidth: 1, lineStyle: 2, title: 'Dyn SL Lower' },
+    gk_upper: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Upper' },
+    gk_lower: { color: 'rgba(255,214,0,0.7)', lineWidth: 1, lineStyle: 1, title: 'Dyn TP Lower' },
     fib_382: { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.382' },
     fib_500: { color: 'rgba(144,164,174,0.5)', lineWidth: 1, title: 'Fib 0.500' },
     fib_618: { color: '#ffd600', lineWidth: 2, title: 'Fib 0.618 Golden' },
@@ -2073,6 +2446,7 @@ function initChart() {
   }
 
   chart.timeScale().subscribeVisibleTimeRangeChange(() => requestAnimationFrame(drawCanvasZones));
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => requestAnimationFrame(drawCanvasZones));
   window.addEventListener('resize', resizeChart);
 
   chart.subscribeCrosshairMove((param) => {
@@ -2109,7 +2483,10 @@ function initChart() {
         <div><b>RSI (14):</b> ${b.rsi}</div>
         <div><b>Score:</b> ${b.score}</div>
       </div>
-      <div style="margin-top:4px;"><b>Regime:</b> <span style="color:${regColor}; font-weight:700;">${b.regime}</span></div>
+      <div style="margin-top:4px;">
+        <b>Regime:</b> <span style="color:${regColor}; font-weight:700;">${b.regime}</span> |
+        <b>Dyn Mults:</b> <span style="color:#00e5ff;">${b.dyn_sl_mult}x SL / ${b.dyn_tp_mult}x TP</span>
+      </div>
       <div class="hud-size-box">
         <div><b>Position Size @ This Bar:</b> Buy/Short <b>${b.sug_shares.toLocaleString()} shares</b> ($${b.sug_pos_val.toLocaleString()})</div>
         <div><b>Dollar Risk:</b> $${b.sug_risk} | <b>Long SL/TP:</b> $${b.long_sl} / $${b.long_tp}</div>
@@ -2128,6 +2505,7 @@ function initChart() {
     if (mode === 'drill') {
       const nextTf = currentData.next_tf;
       if (nextTf === currentTF && currentTF === '1m') return;
+
       if (currentTF === '1Y') {
         const yr = dtObj.getUTCFullYear();
         currentStartTs = Math.floor(Date.UTC(yr, 0, 1) / 1000);
@@ -2138,11 +2516,12 @@ function initChart() {
       } else {
         currentStartTs = clickedTs;
       }
-      currentTF = nextTf;
 
+      currentTF = nextTf;
       breadcrumbs = breadcrumbs.slice(0, activeCrumbIdx + 1);
       const existingIdx = breadcrumbs.findIndex(b => b.tf === currentTF);
       const newTab = { label: `${dtStr} (${currentTF})`, tf: currentTF, startTs: currentStartTs };
+
       if (existingIdx !== -1) {
         breadcrumbs[existingIdx] = newTab;
         breadcrumbs = breadcrumbs.slice(0, existingIdx + 1);
@@ -2166,6 +2545,42 @@ function initChart() {
       loadChartData();
     }
   });
+}
+
+/**
+ * SMART LOGICAL-BAR TRADE ZOOM
+ * Zooms accurately across 1Y, 1M, 1W, 1D, 1H, 15m, 5m, and 1m timeframes using bar indices
+ * rather than fixed seconds, and highlights the selected trade's TP/SL box on the chart.
+ */
+function focusTradeOnChart(t, rowEl) {
+  if (!chart || !currentData) return;
+  focusedTradeNo = t.trade_no;
+
+  document.querySelectorAll('#trade-log-table tbody tr').forEach(r => r.classList.remove('selected-trade-row'));
+  if (rowEl) rowEl.classList.add('selected-trade-row');
+
+  const eIdx = (typeof t.entry_bar_idx === 'number') ? t.entry_bar_idx : 0;
+  const xIdx = (typeof t.exit_bar_idx === 'number') ? t.exit_bar_idx : eIdx + 1;
+  const spanBars = Math.max(1, xIdx - eIdx);
+
+  // Ensure at least ~18 bars of context on each side so the candle, entry arrow,
+  // scale-out markers, and shaded TP/SL box are framed cleanly in the center of the viewport
+  const padBars = Math.max(18, Math.round(spanBars * 1.35));
+  const fromLogical = Math.max(-5, eIdx - padBars);
+  const toLogical = Math.min(currentData.total_bars + 5, xIdx + padBars);
+
+  chart.priceScale('right').applyOptions({ autoScale: true });
+  chart.timeScale().setVisibleLogicalRange({
+    from: fromLogical,
+    to: toLogical
+  });
+
+  // Ensure TP/SL boxes checkbox is turned on so user sees the trade setup clearly
+  const boxChk = document.getElementById('chk_tpsl_boxes');
+  if (boxChk && !boxChk.checked) {
+    boxChk.checked = true;
+  }
+  requestAnimationFrame(drawCanvasZones);
 }
 
 function renderBreadcrumbs() {
@@ -2194,7 +2609,6 @@ function renderBreadcrumbs() {
       deleteCrumb(idx);
     };
     el.appendChild(closeBtn);
-
     bar.appendChild(el);
   });
 
@@ -2231,14 +2645,8 @@ function switchTF(tf) {
   if (activeCrumbIdx === 0) {
     currentStartTs = null;
   }
-  const datePrefix = currentStartTs
-    ? new Date(currentStartTs * 1000).toISOString().slice(0, 10)
-    : 'Max';
-  breadcrumbs[activeCrumbIdx] = {
-    label: `${datePrefix} (${tf})`,
-    tf: tf,
-    startTs: currentStartTs
-  };
+  const datePrefix = currentStartTs ? new Date(currentStartTs * 1000).toISOString().slice(0, 10) : 'Max';
+  breadcrumbs[activeCrumbIdx] = { label: `${datePrefix} (${tf})`, tf: tf, startTs: currentStartTs };
   loadChartData();
 }
 
@@ -2247,6 +2655,7 @@ function resetToRoot() {
   currentStartTs = null;
   currentCutoffTs = null;
   manualEntryTs = null;
+  focusedTradeNo = null;
   breadcrumbs = [{ label: `Max (1Y)`, tf: '1Y', startTs: null }];
   activeCrumbIdx = 0;
   loadChartData();
@@ -2255,6 +2664,7 @@ function resetToRoot() {
 function clearCutoffAndManual() {
   currentCutoffTs = null;
   manualEntryTs = null;
+  focusedTradeNo = null;
   loadChartData();
 }
 
@@ -2264,6 +2674,7 @@ function onStrategyChange() {
 
 async function loadChartData() {
   renderBreadcrumbs();
+  focusedTradeNo = null;
   const params = new URLSearchParams({
     ticker: document.getElementById('ticker').value,
     tf: currentTF,
@@ -2271,7 +2682,13 @@ async function loadChartData() {
     trade_side: document.getElementById('trade_side').value,
     sl_mult: document.getElementById('sl_mult').value,
     tp_mult: document.getElementById('tp_mult').value,
+    dynamic_tpsl: document.getElementById('dynamic_tpsl').value,
     vol_model: document.getElementById('vol_model').value,
+    enable_scale_out: document.getElementById('enable_scale_out').checked ? 'true' : 'false',
+    t1_gain_pct: document.getElementById('t1_gain_pct').value,
+    t1_sell_pct: document.getElementById('t1_sell_pct').value,
+    t2_gain_pct: document.getElementById('t2_gain_pct').value,
+    t2_sell_pct: document.getElementById('t2_sell_pct').value,
     w_trend: document.getElementById('w_trend').value,
     w_liq: document.getElementById('w_liq').value,
     w_rev: document.getElementById('w_rev').value,
@@ -2287,14 +2704,13 @@ async function loadChartData() {
 
   const res = await fetch(`/api/analyze?${params.toString()}`);
   const data = await res.json();
-
   const banner = document.getElementById('alert-banner');
+
   if (data.error) {
     banner.style.display = 'block';
     banner.textContent = data.error;
     return;
   }
-
   currentData = data;
 
   let msgs = [];
@@ -2366,13 +2782,14 @@ function renderOverlays() {
   lineSeriesMap.orb_low.setData(showOrb ? s.orb_low : []);
 
   const st = currentData.backtest.stats;
+  const lm = currentData.latest_metrics;
   document.getElementById('chart-legend').innerHTML = `
-    <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${currentData.total_bars} bars) |
-    Close: $${currentData.latest_metrics.close} | ATR: $${currentData.latest_metrics.atr} | GK Vol: ${currentData.latest_metrics.gk_daily_vol_pct}%<br>
-    <span style="color:#00e676">Active Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span> |
-    Closed Trades: ${st.total_trades} (Long: ${st.long_trades} / Short: ${st.short_trades}) | Win Rate: ${st.win_rate_pct}%
+    <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${currentData.total_bars} bars)
+    | Close: $${lm.close} | ATR: $${lm.atr} | GK Vol: ${lm.gk_daily_vol_pct}% | <span style="color:#00e5ff">Dyn Mults: ${lm.dyn_sl_mult}x SL / ${lm.dyn_tp_mult}x TP</span><br>
+    <span style="color:#00e676">Total Portfolio Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span>
+    | Core Pool Cash: $${st.core_cash_end.toLocaleString()} | Intraday Pool Cash: $${st.intraday_cash_end.toLocaleString()}
+    | Trades: ${st.total_trades} (${st.long_trades}L/${st.short_trades}S) | Win Rate: ${st.win_rate_pct}%
   `;
-
   requestAnimationFrame(drawCanvasZones);
 }
 
@@ -2383,8 +2800,8 @@ function drawCanvasZones() {
   canvas.height = wrap.clientHeight;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
   if (!currentData) return;
+
   const tsScale = chart.timeScale();
 
   if (document.getElementById('chk_unclear').checked && currentData.unclear_spans) {
@@ -2426,28 +2843,51 @@ function drawCanvasZones() {
       const yTp = candleSeries.priceToCoordinate(b.tp);
       const ySl = candleSeries.priceToCoordinate(b.sl);
       if (x1 === null || x2 === null || yEntry === null || yTp === null || ySl === null) return;
-      const w = Math.max(x2 - x1, 14);
 
-      ctx.fillStyle = 'rgba(0, 230, 118, 0.16)';
-      ctx.strokeStyle = 'rgba(0, 230, 118, 0.8)';
+      const w = Math.max(x2 - x1, 14);
+      const isFocused = (focusedTradeNo !== null && b.trade_no === focusedTradeNo);
+
+      // Profit zone
+      ctx.fillStyle = isFocused ? 'rgba(0, 230, 118, 0.28)' : 'rgba(0, 230, 118, 0.15)';
+      ctx.strokeStyle = isFocused ? '#00e676' : 'rgba(0, 230, 118, 0.75)';
+      ctx.lineWidth = isFocused ? 2 : 1;
       ctx.fillRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
       ctx.strokeRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
 
-      ctx.fillStyle = 'rgba(255, 23, 68, 0.16)';
-      ctx.strokeStyle = 'rgba(255, 23, 68, 0.8)';
+      // Stop-Loss zone
+      ctx.fillStyle = isFocused ? 'rgba(255, 23, 68, 0.28)' : 'rgba(255, 23, 68, 0.15)';
+      ctx.strokeStyle = isFocused ? '#ff1744' : 'rgba(255, 23, 68, 0.75)';
       ctx.fillRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
       ctx.strokeRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
 
-      const yGkTp = candleSeries.priceToCoordinate(b.alt_tp);
-      const yGkSl = candleSeries.priceToCoordinate(b.alt_sl);
-      if (yGkTp !== null && yGkSl !== null) {
+      // Draw T1 & T2 scale-out ladder dashed lines inside box
+      if (b.t1_lvl && b.t2_lvl) {
+        const yT1 = candleSeries.priceToCoordinate(b.t1_lvl);
+        const yT2 = candleSeries.priceToCoordinate(b.t2_lvl);
         ctx.save();
-        ctx.setLineDash([3, 3]);
-        ctx.strokeStyle = '#ffd600';
-        ctx.beginPath();
-        ctx.moveTo(x1, yGkTp); ctx.lineTo(x1 + w, yGkTp);
-        ctx.moveTo(x1, yGkSl); ctx.lineTo(x1 + w, yGkSl);
-        ctx.stroke();
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = 'rgba(128, 216, 255, 0.75)';
+        ctx.lineWidth = 1;
+        if (yT1 !== null) {
+          ctx.beginPath(); ctx.moveTo(x1, yT1); ctx.lineTo(x1 + w, yT1); ctx.stroke();
+        }
+        if (yT2 !== null) {
+          ctx.beginPath(); ctx.moveTo(x1, yT2); ctx.lineTo(x1 + w, yT2); ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      // Highlight spotlight ring when user clicks this trade in the table
+      if (isFocused) {
+        const topY = Math.min(yTp, ySl, yEntry) - 6;
+        const botY = Math.max(yTp, ySl, yEntry) + 6;
+        ctx.save();
+        ctx.strokeStyle = '#00e5ff';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(x1 - 4, topY, w + 8, botY - topY);
+        ctx.fillStyle = '#00e5ff';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillText(`Trade #${b.trade_no} (${b.side})`, x1 - 2, Math.max(14, topY - 4));
         ctx.restore();
       }
     });
@@ -2461,26 +2901,20 @@ function updateTradeLogTable(data) {
   document.getElementById('trade-count-badge').textContent = `${trades.length} Total Executions`;
 
   if (trades.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="16" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="17" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view.</td></tr>`;
     return;
   }
 
   trades.forEach(t => {
     const tr = document.createElement('tr');
     tr.style.cursor = 'pointer';
-    tr.title = 'Click to focus chart on this trade';
-    tr.onclick = () => {
-      const pad = Math.max(86400 * 5, (t.exit_time - t.entry_time) * 2);
-      chart.timeScale().setVisibleRange({
-        from: t.entry_time - pad,
-        to: t.exit_time + pad
-      });
-    };
+    tr.title = 'Click to zoom chart directly to this trade';
+    tr.onclick = () => focusTradeOnChart(t, tr);
 
     const sideCls = t.side === 'LONG' ? 'pos' : 'neg';
     const pnlCls = t.pnl >= 0 ? 'pos' : 'neg';
-    const resBadge = t.type === 'TP'
-      ? `<span class="pill pill-cheap">TP WIN</span>`
+    const resBadge = (t.type === 'TP' || t.type === 'TRAIL-WIN')
+      ? `<span class="pill pill-cheap">${t.type}</span>`
       : (t.type === 'SL' ? `<span class="pill pill-exp">SL LOSS</span>` : `<span class="pill pill-fair">OPEN</span>`);
 
     tr.innerHTML = `
@@ -2490,10 +2924,11 @@ function updateTradeLogTable(data) {
       <td>${t.pool}</td>
       <td>${t.entry_dt}</td>
       <td><b>$${t.entry_price}</b></td>
-      <td style="color:#ffd600; font-weight:700;">${t.shares.toLocaleString()} sh (Vol: ${t.bar_volume.toLocaleString()} | ${t.bar_rvol}x)</td>
+      <td style="color:#ffd600; font-weight:700;">${t.shares.toLocaleString()} sh (RVOL ${t.bar_rvol}x)</td>
       <td>$${t.position_value.toLocaleString()} (${t.alloc_pct}%)</td>
       <td>$${t.dollar_risk.toLocaleString()}</td>
       <td>$${t.sl_price} / $${t.tp_price}</td>
+      <td style="color:#80d8ff; font-size:10.5px;">${t.scale_summary || '100% @ Exit'}</td>
       <td>${t.exit_dt}</td>
       <td>$${t.exit_price}</td>
       <td>${resBadge}</td>
@@ -2568,8 +3003,8 @@ async function loadOptionChain(selectedExp = '') {
 
   const res = await fetch(`/api/option_chain?${params.toString()}`);
   const data = await res.json();
-
   document.getElementById('chain-source').textContent = data.source;
+
   const expSel = document.getElementById('chain_expiry');
   expSel.innerHTML = '';
   (data.expirations || []).forEach(exp => {
@@ -2623,8 +3058,7 @@ async function loadContractHistory(contractSym, strike, optType, ivPct) {
   const d = await res.json();
   const box = document.getElementById('contract-history-box');
   box.style.display = 'block';
-  document.getElementById('contract-hist-title').textContent =
-    `Option Contract Daily History: ${d.contract} (${d.source}) — Last ${d.bars.length} Sessions`;
+  document.getElementById('contract-hist-title').textContent = `Option Contract Daily History: ${d.contract} (${d.source}) — Last ${d.bars.length} Sessions`;
   const strip = document.getElementById('contract-hist-strip');
   strip.innerHTML = '';
   d.bars.slice(-15).forEach(b => {
