@@ -11,11 +11,8 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Dual-System Re-Entry & Trade Inspector")
+app = FastAPI(title="Quant Lab: Signal & SL/TP Projection Engine")
 
-# ==============================================================================
-# 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
-# ==============================================================================
 def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -> float:
     try:
         f = float(val)
@@ -37,9 +34,6 @@ def _sanitize_for_json(obj: Any) -> Any:
         return int(obj)
     return obj
 
-# ==============================================================================
-# 1. DISK + MEMORY CACHE & MAX-LOOKBACK MULTI-SOURCE DATA ENGINE
-# ==============================================================================
 DATA_CACHE: Dict[str, pd.DataFrame] = {}
 DATA_CACHE_TS: Dict[str, float] = {}
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yf_cache")
@@ -368,9 +362,6 @@ def fetch_and_construct_tf(ticker: str, tf: str, force_refresh: bool = False) ->
             DATA_CACHE_TS[cache_key] = now_ts
         return DATA_CACHE[cache_key].copy(), warn_msg
 
-# ==============================================================================
-# 2. QUANTITATIVE INDICATORS (WITH EMA 200) & DYNAMIC SL/TP FORMULA ENGINE
-# ==============================================================================
 def compute_all_indicators(
     df: pd.DataFrame,
     tf: str,
@@ -554,69 +545,66 @@ def compute_all_indicators(
 
     return df, unavailable_indicators
 
-# ==============================================================================
-# 3. DUAL-POOL PORTFOLIO, EMA 200 FILTER, CONTINUOUS RE-ENTRY & BACKTEST ENGINE
-# ==============================================================================
 STRATEGY_METADATA = {
     "trend": {
         "name": "1. Core Trend (EMA 20/50/200 + Volume)",
         "indicators": ["ema20", "ema50", "ema200", "atr_bands"],
         "bucket": "Core 70%",
-        "guide": "Rides established macro trends. Enters on pullbacks toward EMA 20 and continuously re-enters on subsequent dips as long as the trend remains bullish."
+        "guide": "Rides established macro trends. Displays entry signals and projected SL/TP boxes on pullbacks toward EMA 20."
     },
     "watch_dip": {
         "name": "2. Watch -> Pullback/Rally -> Buy/Short",
         "indicators": ["ema20", "ema50", "ema200", "vwap", "gk_bands"],
         "bucket": "Core 70%",
-        "guide": "Monitors trend momentum, waits for measured pullback/rally exhaustion, and re-enters iteratively on repeated dips."
+        "guide": "Monitors trend momentum and displays projected SL/TP boxes upon pullback exhaustion."
     },
     "smc_fvg": {
         "name": "3. SMC & Fair Value Gaps (Bull/Bear FVG)",
         "indicators": ["fvg_zones", "ema50", "ema200", "atr_bands"],
         "bucket": "Satellite 30%",
-        "guide": "Smart Money Concepts: Trades repeated institutional Fair Value Gap retests during prevailing market trends."
+        "guide": "Smart Money Concepts: Highlights Fair Value Gap retest signals and projected risk boxes."
     },
     "fib_golden": {
         "name": "4. Fibonacci Golden Pocket (0.618 / 0.382)",
         "indicators": ["fib_levels", "ema50", "ema200"],
         "bucket": "Core 70%",
-        "guide": "Repeatedly buys the 0.618 golden pocket retracement in bull regimes or shorting the 0.382 zone in bear regimes."
+        "guide": "Displays Fibonacci golden pocket signals and projected SL/TP zones."
     },
     "orb": {
         "name": "5. Opening Range Breakout/Breakdown (ORB)",
         "indicators": ["orb_levels", "vwap", "ema200"],
         "bucket": "Satellite 30%",
-        "guide": "Intraday momentum opening range breakout capturing strong early session breakouts."
+        "guide": "Intraday momentum opening range breakout signals and projected risk boxes."
     },
     "do_t": {
         "name": "6. Intraday 'Do T' (VWAP +-2 Sigma L/S)",
         "indicators": ["vwap", "vwap_bands", "gk_bands", "ema200"],
         "bucket": "Satellite 30%",
-        "guide": "Mean-reversion strategy fading extreme intraday extensions beyond VWAP bands."
+        "guide": "Mean-reversion signals and projected SL/TP boxes at VWAP band extremes."
     },
     "composite": {
         "name": "7. Composite Score (Alpha*A + Beta*B + Gamma*C)",
         "indicators": ["ema20", "ema200", "vwap", "gk_bands"],
         "bucket": "Core 70%",
-        "guide": "Multi-factor quantitative alpha model combining trend slope, price pressure liquidity, and VWAP z-scores."
+        "guide": "Multi-factor quantitative alpha signals and projected SL/TP risk boxes."
     },
     "scale_ladder": {
         "name": "8. Momentum Scale-Out Ladder (Sell xx% @ +xx% Tiers)",
         "indicators": ["ema20", "ema200", "vwap", "gk_bands", "atr_bands"],
         "bucket": "Core 70%",
-        "guide": "Trend following with multi-tier partial profit taking and automatic trend re-entry on new dips."
+        "guide": "Momentum scale-out signals and multi-tier projected SL/TP boxes."
     },
     "plain_tpsl": {
         "name": "9. Plain TP/SL & Manual Replay Sandbox",
         "indicators": ["ema20", "ema200", "atr_bands", "gk_bands"],
         "bucket": "Sandbox",
-        "guide": "Manual sandbox mode for testing custom entries or fixed risk/reward parameters."
+        "guide": "Manual sandbox mode for displaying custom SL/TP projection boxes."
     },
     "no_tp_trend": {
         "name": "10. Dynamic Trailing SL / No Static TP (Trend Hold)",
         "indicators": ["ema20", "ema50", "ema200", "atr_bands"],
         "bucket": "Core 70%",
-        "guide": "Never sets a static Take-Profit. Holds positions as long as trend is intact, continuously ratcheting trailing stop-loss behind price action."
+        "guide": "Displays continuous trailing stop-loss projection boxes without static take-profit targets."
     }
 }
 
@@ -658,11 +646,10 @@ def run_strategy_backtest(
 
     dt_index = df.index
     timestamps = [int(ts.timestamp()) for ts in dt_index]
-    opens = df['open'].values
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
-    volumes = df['volume'].values
+    opens = df['open'].values
     atrs = df['atr'].values
     gks = df['gk_sigma_dollar'].values
     dyn_sl_arr = df['dyn_sl_mult'].values
@@ -687,94 +674,13 @@ def run_strategy_backtest(
     comp_score = df['composite_score'].values
     rsi = df['rsi'].values
 
-    is_intraday_strat = strategy_key in ["orb", "do_t", "smc_fvg"]
-    core_cash = initial_capital * core_pct
-    intraday_cash = initial_capital * intraday_pct
-    pool_label = f"Intraday ({int(intraday_pct*100)}%)" if is_intraday_strat else f"Core ({int(core_pct*100)}%)"
-
-    peak_equity = initial_capital
-    max_dd_pct = 0.0
-
-    state = 0
-    watch_peak = 0.0
-    watch_trough = 0.0
-    entry_price = 0.0
-    sl_price = 0.0
-    initial_sl_price = 0.0
-    tp_price = 0.0
-    alt_sl_price = 0.0
-    alt_tp_price = 0.0
-    entry_sl_mult_used = sl_mult
-    entry_tp_mult_used = tp_mult
-    entry_idx = 0
-    initial_shares = 0
-    remaining_shares = 0
-    reserved_cash = 0.0
-    realized_trade_pnl = 0.0
-    scale_stage = 0
-    t1_target_price = 0.0
-    t2_target_price = 0.0
-    scale_notes: List[str] = []
-    entry_signal_reason = ""
-    dollar_risk_at_entry = 0.0
-    running_extreme = 0.0
-
-    trades = []
     markers = []
     boxes = []
     equity_curve = []
-
-    def _get_active_pool_cash() -> float:
-        return intraday_cash if is_intraday_strat else core_cash
-
-    def _set_active_pool_cash(new_val: float) -> None:
-        nonlocal core_cash, intraday_cash
-        if is_intraday_strat:
-            intraday_cash = new_val
-        else:
-            core_cash = new_val
-
-    def _total_portfolio_equity(mark_price: float) -> float:
-        open_val = 0.0
-        if state == 2 and remaining_shares > 0:
-            open_val = remaining_shares * mark_price
-        elif state == -2 and remaining_shares > 0:
-            open_val = reserved_cash + (entry_price - mark_price) * remaining_shares
-        return core_cash + intraday_cash + open_val
-
-    def _calc_shares(ep: float, slp: float, force_alloc_pct: Optional[float] = None) -> tuple[int, float]:
-        tot_eq = max(_total_portfolio_equity(ep), 1000.0)
-        avail_pool_cash = max(_get_active_pool_cash(), 0.0)
-        if force_alloc_pct is not None and force_alloc_pct > 0:
-            target_dollars = tot_eq * (min(force_alloc_pct, 100.0) / 100.0)
-            shares_int = max(1, int(math.floor(target_dollars / max(ep, 0.01))))
-            actual_risk = shares_int * abs(ep - slp)
-            return shares_int, actual_risk
-        if avail_pool_cash < ep:
-            return 0, 0.0
-        risk_budget = tot_eq * risk_per_trade_pct
-        stop_dist = max(abs(ep - slp), ep * 0.004, 0.01)
-        raw_shares = min(risk_budget / stop_dist, (avail_pool_cash * 0.98) / max(ep, 0.01))
-        if math.isnan(raw_shares) or math.isinf(raw_shares):
-            raw_shares = 0.0
-        shares_int = max(0, int(math.floor(raw_shares)))
-        if shares_int == 0 and avail_pool_cash >= ep:
-            shares_int = 1
-        actual_risk = shares_int * abs(ep - slp)
-        return shares_int, actual_risk
-
-    def _compute_tier_targets(ep: float, tp_p: float, is_long: bool) -> tuple[float, float]:
-        full_dist = abs(tp_p - ep)
-        pct_dist_1 = ep * (max(t1_gain_pct, 0.1) / 100.0)
-        pct_dist_2 = ep * (max(t2_gain_pct, 0.2) / 100.0)
-        d1 = min(pct_dist_1, full_dist * 0.45) if tf in ["1h", "15m", "5m", "1m"] else min(pct_dist_1, full_dist * 0.55)
-        d2 = min(pct_dist_2, full_dist * 0.78) if tf in ["1h", "15m", "5m", "1m"] else min(pct_dist_2, full_dist * 0.82)
-        d1 = max(d1, ep * 0.002)
-        d2 = max(d2, d1 * 1.35)
-        if is_long:
-            return ep + d1, ep + d2
-        else:
-            return ep - d1, ep - d2
+    
+    cur_eq = initial_capital
+    for i in range(n):
+        equity_curve.append({"time": timestamps[i], "value": cur_eq})
 
     for i in range(1, n):
         ts = timestamps[i]
@@ -799,12 +705,10 @@ def run_strategy_backtest(
         elif eff_strat == "watch_dip":
             trend_long = ema20[i] > ema50[i]
             trend_short = ema20[i] < ema50[i]
-            if state in [0, 1, 3]:
-                watch_peak = max(watch_peak, c_high)
-                trig_long = ((watch_peak - c_low) >= 0.8 * unit_vol) and (c_close > c_open) and trend_long
-            if state in [0, -1, -3]:
-                watch_trough = min(watch_trough, c_low) if watch_trough > 0 else c_low
-                trig_short = ((c_high - watch_trough) >= 0.8 * unit_vol) and (c_close < c_open) and trend_short
+            watch_peak = max(highs[max(0, i-5):i]) if i >= 5 else c_high
+            watch_trough = min(lows[max(0, i-5):i]) if i >= 5 else c_low
+            trig_long = ((watch_peak - c_low) >= 0.8 * unit_vol) and (c_close > c_open) and trend_long
+            trig_short = ((c_high - watch_trough) >= 0.8 * unit_vol) and (c_close < c_open) and trend_short
         elif eff_strat == "smc_fvg":
             trend_long = c_close >= ema50[i] * 0.98
             trig_long = bool(smc_bull[i]) and trend_long
@@ -837,422 +741,90 @@ def run_strategy_backtest(
             trend_short = (c_close < ema20[i]) and (ema20[i] <= ema50[i] * 1.005)
             trig_short = trend_short and (c_close < vwap[i]) and (rvol[i] >= 1.05) and (c_close < c_open)
         elif eff_strat == "plain_tpsl":
-            if manual_entry_ts is not None:
-                is_hit_bar = (ts >= manual_entry_ts) and (timestamps[i - 1] < manual_entry_ts or i == 1)
-                if manual_side == "short":
-                    trend_short = True
-                    trig_short = is_hit_bar
-                else:
-                    trend_long = True
-                    trig_long = is_hit_bar
-            else:
-                trend_long = c_close > ema20[i]
-                trig_long = (c_close > highs[i - 1]) and (c_close > c_open)
-                trend_short = c_close < ema20[i]
-                trig_short = (c_close < lows[i - 1]) and (c_close < c_open)
+            trend_long = c_close > ema20[i]
+            trig_long = (c_close > highs[i - 1]) and (c_close > c_open)
+            trend_short = c_close < ema20[i]
+            trig_short = (c_close < lows[i - 1]) and (c_close < c_open)
 
-        if manual_entry_ts is None:
-            if ema200_filter == "trend_follow":
-                if c_close < ema200[i]:
-                    trend_long, trig_long = False, False
-                if c_close > ema200[i]:
-                    trend_short, trig_short = False, False
-            elif ema200_filter == "counter_trend":
-                if c_close >= ema200[i]:
-                    trend_long, trig_long = False, False
-                if c_close <= ema200[i]:
-                    trend_short, trig_short = False, False
+        if ema200_filter == "trend_follow":
+            if c_close < ema200[i]:
+                trig_long = False
+            if c_close > ema200[i]:
+                trig_short = False
+        elif ema200_filter == "counter_trend":
+            if c_close >= ema200[i]:
+                trig_long = False
+            if c_close <= ema200[i]:
+                trig_short = False
 
         if not allow_long:
-            trend_long, trig_long = False, False
+            trig_long = False
         if not allow_short:
-            trend_short, trig_short = False, False
+            trig_short = False
 
-        # STATE MACHINE TRANSITIONS (Continuous Re-Entry Logic)
-        if state == 0:
-            if strategy_key == "plain_tpsl" and manual_entry_ts is not None and (trig_long or trig_short):
-                is_long = trig_long
-                entry_price = c_close
-                entry_idx = i
-                entry_sl_mult_used = cur_sl_mult
-                entry_tp_mult_used = cur_tp_mult
-                safe_atr = _clean_float(atrs[i], c_close * 0.015)
-                safe_gk = _clean_float(gks[i], safe_atr)
-                if is_long:
-                    sl_price = entry_price - cur_sl_mult * safe_atr
-                    tp_price = entry_price + cur_tp_mult * safe_atr
-                    alt_sl_price = entry_price - cur_sl_mult * safe_gk
-                    alt_tp_price = entry_price + cur_tp_mult * safe_gk
-                    running_extreme = c_high
-                else:
-                    sl_price = entry_price + cur_sl_mult * safe_atr
-                    tp_price = entry_price - cur_tp_mult * safe_atr
-                    alt_sl_price = entry_price + cur_sl_mult * safe_gk
-                    alt_tp_price = entry_price - cur_tp_mult * safe_gk
-                    running_extreme = c_low
+        if trig_long:
+            entry_p = c_close
+            sl_p = entry_p - cur_sl_mult * unit_vol
+            tp_p = entry_p + cur_tp_mult * unit_vol
+            t_end_idx = min(i + 12, n - 1)
+            t_end_ts = timestamps[t_end_idx]
 
-                sh, d_risk = _calc_shares(entry_price, sl_price, force_alloc_pct=manual_alloc_pct)
-                if sh > 0:
-                    state = 2 if is_long else -2
-                    initial_shares = sh
-                    remaining_shares = sh
-                    initial_sl_price = sl_price
-                    dollar_risk_at_entry = d_risk
-                    reserved_cash = sh * entry_price
-                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
-                    realized_trade_pnl = 0.0
-                    scale_stage = 0
-                    scale_notes = []
-                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, is_long)
-                    entry_signal_reason = f"MANUAL ({cur_sl_mult}x)"
-                    markers.append({
-                        "time": ts, "position": "belowBar" if is_long else "aboveBar",
-                        "color": "#00E676" if is_long else "#FF4081",
-                        "shape": "arrowUp" if is_long else "arrowDown",
-                        "text": f"MANUAL {'BUY' if is_long else 'SHORT'} ({sh} sh @ ${entry_price:.2f})"
-                    })
-            elif trig_long:
-                entry_price = c_close
-                entry_idx = i
-                entry_sl_mult_used = cur_sl_mult
-                entry_tp_mult_used = cur_tp_mult
-                sl_price = entry_price - cur_sl_mult * unit_vol
-                tp_price = entry_price + cur_tp_mult * unit_vol
-                running_extreme = c_high
+            markers.append({
+                "time": ts, "position": "belowBar", "color": "#00E676",
+                "shape": "arrowUp", "text": f"SIGNAL LONG (@ ${entry_p:.2f})"
+            })
+            boxes.append({
+                "trade_no": len(boxes) + 1, "side": "LONG", "t1": ts, "t2": t_end_ts,
+                "entry": _clean_float(entry_p), "tp": _clean_float(tp_p) if not is_no_tp else _clean_float(entry_p),
+                "sl": _clean_float(sl_p), "t1_lvl": _clean_float(entry_p + 0.04 * entry_p),
+                "t2_lvl": _clean_float(entry_p + 0.08 * entry_p), "outcome": "PROJECTED"
+            })
 
-                sh, d_risk = _calc_shares(entry_price, sl_price)
-                if sh > 0:
-                    state = 2
-                    initial_shares = sh
-                    remaining_shares = sh
-                    initial_sl_price = sl_price
-                    dollar_risk_at_entry = d_risk
-                    reserved_cash = sh * entry_price
-                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
-                    realized_trade_pnl = 0.0
-                    scale_stage = 0
-                    scale_notes = []
-                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, True)
-                    entry_signal_reason = f"LONG ({cur_sl_mult}x)"
-                    markers.append({
-                        "time": ts, "position": "belowBar", "color": "#00E676",
-                        "shape": "arrowUp", "text": f"BUY {sh} sh @ ${entry_price:.2f}"
-                    })
-            elif trig_short:
-                entry_price = c_close
-                entry_idx = i
-                entry_sl_mult_used = cur_sl_mult
-                entry_tp_mult_used = cur_tp_mult
-                sl_price = entry_price + cur_sl_mult * unit_vol
-                tp_price = entry_price - cur_tp_mult * unit_vol
-                running_extreme = c_low
+        if trig_short:
+            entry_p = c_close
+            sl_p = entry_p + cur_sl_mult * unit_vol
+            tp_p = entry_p - cur_tp_mult * unit_vol
+            t_end_idx = min(i + 12, n - 1)
+            t_end_ts = timestamps[t_end_idx]
 
-                sh, d_risk = _calc_shares(entry_price, sl_price)
-                if sh > 0:
-                    state = -2
-                    initial_shares = sh
-                    remaining_shares = sh
-                    initial_sl_price = sl_price
-                    dollar_risk_at_entry = d_risk
-                    reserved_cash = sh * entry_price
-                    _set_active_pool_cash(_get_active_pool_cash() - reserved_cash)
-                    realized_trade_pnl = 0.0
-                    scale_stage = 0
-                    scale_notes = []
-                    t1_target_price, t2_target_price = _compute_tier_targets(entry_price, tp_price, False)
-                    entry_signal_reason = f"SHORT ({cur_sl_mult}x)"
-                    markers.append({
-                        "time": ts, "position": "aboveBar", "color": "#FF1744",
-                        "shape": "arrowDown", "text": f"SHORT {sh} sh @ ${entry_price:.2f}"
-                    })
-
-        # ACTIVE LONG POSITION MANAGEMENT
-        elif state == 2:
-            if not use_original_engine:
-                if c_high > running_extreme:
-                    running_extreme = c_high
-                potential_trailing_sl = running_extreme - (cur_sl_mult * unit_vol)
-                if potential_trailing_sl > sl_price:
-                    sl_price = potential_trailing_sl
-
-            trend_reversal = (c_close < ema50[i] and ema20[i] < ema50[i]) if is_no_tp else False
-            do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
-            hit_sl = c_low <= sl_price
-
-            if do_ladder and not is_no_tp and not use_original_engine and not hit_sl and remaining_shares >= 3:
-                if scale_stage == 0 and c_high >= t1_target_price and t1_target_price < tp_price:
-                    qty1 = max(1, int(round(initial_shares * (t1_sell_pct / 100.0))))
-                    qty1 = min(qty1, remaining_shares - 1)
-                    if qty1 > 0:
-                        part_pnl = (t1_target_price - entry_price) * qty1
-                        realized_trade_pnl += part_pnl
-                        _set_active_pool_cash(_get_active_pool_cash() + (qty1 * entry_price) + part_pnl)
-                        remaining_shares -= qty1
-                        reserved_cash = remaining_shares * entry_price
-                        scale_stage = 1
-                        sl_price = max(sl_price, entry_price)
-                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
-                        markers.append({
-                            "time": ts, "position": "aboveBar", "color": "#80D8FF",
-                            "shape": "circle", "text": f"T1 SELL {qty1}sh (+${part_pnl:,.0f})"
-                        })
-
-                if scale_stage == 1 and c_high >= t2_target_price and t2_target_price < tp_price and remaining_shares >= 2:
-                    qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
-                    qty2 = min(qty2, remaining_shares - 1)
-                    if qty2 > 0:
-                        part_pnl = (t2_target_price - entry_price) * qty2
-                        realized_trade_pnl += part_pnl
-                        _set_active_pool_cash(_get_active_pool_cash() + (qty2 * entry_price) + part_pnl)
-                        remaining_shares -= qty2
-                        reserved_cash = remaining_shares * entry_price
-                        scale_stage = 2
-                        sl_price = max(sl_price, t1_target_price)
-                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
-                        markers.append({
-                            "time": ts, "position": "aboveBar", "color": "#40C4FF",
-                            "shape": "circle", "text": f"T2 SELL {qty2}sh (+${part_pnl:,.0f})"
-                        })
-
-            hit_tp = (c_high >= tp_price) and not is_no_tp
-            hit_sl = c_low <= sl_price
-            exit_on_trend = is_no_tp and trend_reversal
-
-            if hit_tp or hit_sl or exit_on_trend:
-                if hit_tp:
-                    exit_price = tp_price
-                    res_type = "TP"
-                elif hit_sl:
-                    exit_price = sl_price
-                    res_type = "SL"
-                else:
-                    exit_price = c_close
-                    res_type = "TREND-EXIT"
-
-                rem_pnl = (exit_price - entry_price) * remaining_shares
-                _set_active_pool_cash(_get_active_pool_cash() + (remaining_shares * entry_price) + rem_pnl)
-                total_pnl = realized_trade_pnl + rem_pnl
-                pos_val = entry_price * initial_shares
-                ret_pct = (total_pnl / max(pos_val, 1e-6)) * 100.0
-                remaining_shares = 0
-                reserved_cash = 0.0
-                state = 0
-                cur_eq = _total_portfolio_equity(c_close)
-                alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
-                ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
-
-                trades.append({
-                    "trade_no": len(trades) + 1, "side": "LONG", "signal_type": entry_signal_reason,
-                    "pool": pool_label, "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(i),
-                    "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-                    "exit_time": ts, "exit_dt": _fmt_dt(dt_index[i], tf), "type": res_type,
-                    "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2) if not is_no_tp else 0.0,
-                    "dyn_mults": f"{entry_sl_mult_used:.2f}x", "scale_summary": ladder_str,
-                    "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(total_pnl, 0.0, 2), "ret_pct": _clean_float(ret_pct, 0.0, 2),
-                    "equity_after": _clean_float(cur_eq, initial_capital, 2)
-                })
-                boxes.append({
-                    "trade_no": len(trades), "side": "LONG", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price) if not is_no_tp else _clean_float(entry_price),
-                    "sl": _clean_float(initial_sl_price), "t1_lvl": _clean_float(t1_target_price),
-                    "t2_lvl": _clean_float(t2_target_price), "alt_tp": _clean_float(alt_tp_price),
-                    "alt_sl": _clean_float(alt_sl_price), "outcome": res_type
-                })
-                markers.append({
-                    "time": ts, "position": "aboveBar",
-                    "color": "#FFD600" if total_pnl > 0 else "#FF1744",
-                    "shape": "arrowDown", "text": f"L-{res_type} ({'+' if total_pnl > 0 else ''}${total_pnl:,.0f})"
-                })
-
-        # ACTIVE SHORT POSITION MANAGEMENT
-        elif state == -2:
-            if not use_original_engine:
-                if c_low < running_extreme:
-                    running_extreme = c_low
-                potential_trailing_sl = running_extreme + (cur_sl_mult * unit_vol)
-                if potential_trailing_sl < sl_price:
-                    sl_price = potential_trailing_sl
-
-            trend_reversal = (c_close > ema50[i] and ema20[i] > ema50[i]) if is_no_tp else False
-            do_ladder = enable_scale_out or (strategy_key == "scale_ladder")
-            hit_sl = c_high >= sl_price
-
-            if do_ladder and not is_no_tp and not use_original_engine and not hit_sl and remaining_shares >= 3:
-                if scale_stage == 0 and c_low <= t1_target_price and t1_target_price > tp_price:
-                    qty1 = max(1, int(round(initial_shares * (t1_sell_pct / 100.0))))
-                    qty1 = min(qty1, remaining_shares - 1)
-                    if qty1 > 0:
-                        part_pnl = (entry_price - t1_target_price) * qty1
-                        realized_trade_pnl += part_pnl
-                        _set_active_pool_cash(_get_active_pool_cash() + (qty1 * entry_price) + part_pnl)
-                        remaining_shares -= qty1
-                        reserved_cash = remaining_shares * entry_price
-                        scale_stage = 1
-                        sl_price = min(sl_price, entry_price)
-                        scale_notes.append(f"T1(-{qty1}sh@${t1_target_price:.2f})")
-                        markers.append({
-                            "time": ts, "position": "belowBar", "color": "#80D8FF",
-                            "shape": "circle", "text": f"T1 COVER {qty1}sh (+${part_pnl:,.0f})"
-                        })
-
-                if scale_stage == 1 and c_low <= t2_target_price and t2_target_price > tp_price and remaining_shares >= 2:
-                    qty2 = max(1, int(round(initial_shares * (t2_sell_pct / 100.0))))
-                    qty2 = min(qty2, remaining_shares - 1)
-                    if qty2 > 0:
-                        part_pnl = (entry_price - t2_target_price) * qty2
-                        realized_trade_pnl += part_pnl
-                        _set_active_pool_cash(_get_active_pool_cash() + (qty2 * entry_price) + part_pnl)
-                        remaining_shares -= qty2
-                        reserved_cash = remaining_shares * entry_price
-                        scale_stage = 2
-                        sl_price = min(sl_price, t1_target_price)
-                        scale_notes.append(f"T2(-{qty2}sh@${t2_target_price:.2f})")
-                        markers.append({
-                            "time": ts, "position": "belowBar", "color": "#40C4FF",
-                            "shape": "circle", "text": f"T2 COVER {qty2}sh (+${part_pnl:,.0f})"
-                        })
-
-            hit_tp = (c_low <= tp_price) and not is_no_tp
-            hit_sl = c_high >= sl_price
-            exit_on_trend = is_no_tp and trend_reversal
-
-            if hit_tp or hit_sl or exit_on_trend:
-                if hit_tp:
-                    exit_price = tp_price
-                    res_type = "TP"
-                elif hit_sl:
-                    exit_price = sl_price
-                    res_type = "SL"
-                else:
-                    exit_price = c_close
-                    res_type = "TREND-EXIT"
-
-                rem_pnl = (entry_price - exit_price) * remaining_shares
-                _set_active_pool_cash(_get_active_pool_cash() + (remaining_shares * entry_price) + rem_pnl)
-                total_pnl = realized_trade_pnl + rem_pnl
-                pos_val = entry_price * initial_shares
-                ret_pct = (total_pnl / max(pos_val, 1e-6)) * 100.0
-                remaining_shares = 0
-                reserved_cash = 0.0
-                state = 0
-                cur_eq = _total_portfolio_equity(c_close)
-                alloc_pct = (pos_val / max(cur_eq - total_pnl, 1.0)) * 100.0
-                ladder_str = " -> ".join(scale_notes) if scale_notes else "100% @ Exit"
-
-                trades.append({
-                    "trade_no": len(trades) + 1, "side": "SHORT", "signal_type": entry_signal_reason,
-                    "pool": pool_label, "entry_bar_idx": int(entry_idx), "exit_bar_idx": int(i),
-                    "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-                    "exit_time": ts, "exit_dt": _fmt_dt(dt_index[i], tf), "type": res_type,
-                    "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(exit_price, 0.0, 2),
-                    "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2) if not is_no_tp else 0.0,
-                    "dyn_mults": f"{entry_sl_mult_used:.2f}x", "scale_summary": ladder_str,
-                    "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-                    "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-                    "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-                    "pnl": _clean_float(total_pnl, 0.0, 2), "ret_pct": _clean_float(ret_pct, 0.0, 2),
-                    "equity_after": _clean_float(cur_eq, initial_capital, 2)
-                })
-                boxes.append({
-                    "trade_no": len(trades), "side": "SHORT", "t1": timestamps[entry_idx], "t2": ts,
-                    "entry": _clean_float(entry_price), "tp": _clean_float(tp_price) if not is_no_tp else _clean_float(entry_price),
-                    "sl": _clean_float(initial_sl_price), "t1_lvl": _clean_float(t1_target_price),
-                    "t2_lvl": _clean_float(t2_target_price), "alt_tp": _clean_float(alt_tp_price),
-                    "alt_sl": _clean_float(alt_sl_price), "outcome": res_type
-                })
-                markers.append({
-                    "time": ts, "position": "belowBar",
-                    "color": "#FFD600" if total_pnl > 0 else "#FF1744",
-                    "shape": "arrowUp", "text": f"S-{res_type} ({'+' if total_pnl > 0 else ''}${total_pnl:,.0f})"
-                })
-
-        live_eq = _total_portfolio_equity(c_close)
-        peak_equity = max(peak_equity, live_eq)
-        dd = ((peak_equity - live_eq) / max(peak_equity, 1.0)) * 100.0
-        max_dd_pct = max(max_dd_pct, dd)
-        equity_curve.append({"time": ts, "value": _clean_float(live_eq, initial_capital, 2)})
-
-    if state in [2, -2] and n > 0 and remaining_shares > 0:
-        is_long_open = (state == 2)
-        last_c = closes[-1]
-        rem_unreal = ((last_c - entry_price) if is_long_open else (entry_price - last_c)) * remaining_shares
-        total_open_pnl = realized_trade_pnl + rem_unreal
-        pos_val = entry_price * initial_shares
-        unreal_pct = (total_open_pnl / max(pos_val, 1e-6)) * 100.0
-        final_eq = _total_portfolio_equity(last_c)
-        alloc_pct = (pos_val / max(final_eq, 1.0)) * 100.0
-        ladder_str = (" -> ".join(scale_notes) + f" ({remaining_shares}sh open)") if scale_notes else f"OPEN ({remaining_shares}sh)"
-
-        trades.append({
-            "trade_no": len(trades) + 1, "side": "LONG" if is_long_open else "SHORT",
-            "signal_type": entry_signal_reason, "pool": pool_label, "entry_bar_idx": int(entry_idx),
-            "exit_bar_idx": int(n - 1), "entry_time": timestamps[entry_idx], "entry_dt": _fmt_dt(dt_index[entry_idx], tf),
-            "exit_time": timestamps[-1], "exit_dt": "OPEN (Active)", "type": "OPEN",
-            "entry_price": _clean_float(entry_price, 0.0, 2), "exit_price": _clean_float(last_c, 0.0, 2),
-            "sl_price": _clean_float(initial_sl_price, 0.0, 2), "tp_price": _clean_float(tp_price, 0.0, 2),
-            "dyn_mults": f"{entry_sl_mult_used:.2f}x", "scale_summary": ladder_str,
-            "shares": int(initial_shares), "position_value": _clean_float(pos_val, 0.0, 2),
-            "alloc_pct": _clean_float(alloc_pct, 0.0, 1), "dollar_risk": _clean_float(dollar_risk_at_entry, 0.0, 2),
-            "bar_volume": int(_clean_float(volumes[entry_idx], 0.0)), "bar_rvol": _clean_float(rvol[entry_idx], 1.0, 2),
-            "pnl": _clean_float(total_open_pnl, 0.0, 2), "ret_pct": _clean_float(unreal_pct, 0.0, 2),
-            "equity_after": _clean_float(final_eq, initial_capital, 2)
-        })
-        boxes.append({
-            "trade_no": len(trades), "side": "LONG" if is_long_open else "SHORT",
-            "t1": timestamps[entry_idx], "t2": timestamps[-1], "entry": _clean_float(entry_price),
-            "tp": _clean_float(tp_price), "sl": _clean_float(initial_sl_price),
-            "t1_lvl": _clean_float(t1_target_price), "t2_lvl": _clean_float(t2_target_price),
-            "alt_tp": _clean_float(alt_tp_price), "alt_sl": _clean_float(alt_sl_price), "outcome": "ACTIVE"
-        })
-
-    final_mark_equity = _total_portfolio_equity(closes[-1]) if n > 0 else initial_capital
-    closed_trades = [t for t in trades if t["type"] in ["TP", "TRAIL-WIN", "SL", "TREND-EXIT", "MANUAL-WIN", "MANUAL-EXIT"]]
-    total_trades = len(closed_trades)
-    long_trades = sum(1 for t in closed_trades if t.get("side") == "LONG")
-    short_trades = sum(1 for t in closed_trades if t.get("side") == "SHORT")
-    wins = [t for t in closed_trades if t['pnl'] > 0]
-    losses = [t for t in closed_trades if t['pnl'] <= 0]
-    win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
-    gross_profit = sum(t['pnl'] for t in wins)
-    gross_loss = abs(sum(t['pnl'] for t in losses))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
-    net_return_pct = ((final_mark_equity - initial_capital) / max(initial_capital, 1.0)) * 100.0
-    buy_hold_ret = ((closes[-1] - closes[0]) / max(closes[0], 1e-6)) * 100.0 if n > 1 else 0.0
+            markers.append({
+                "time": ts, "position": "aboveBar", "color": "#FF1744",
+                "shape": "arrowDown", "text": f"SIGNAL SHORT (@ ${entry_p:.2f})"
+            })
+            boxes.append({
+                "trade_no": len(boxes) + 1, "side": "SHORT", "t1": ts, "t2": t_end_ts,
+                "entry": _clean_float(entry_p), "tp": _clean_float(tp_p) if not is_no_tp else _clean_float(entry_p),
+                "sl": _clean_float(sl_p), "t1_lvl": _clean_float(entry_p - 0.04 * entry_p),
+                "t2_lvl": _clean_float(entry_p - 0.08 * entry_p), "outcome": "PROJECTED"
+            })
 
     stats = {
         "strategy_key": strategy_key,
         "strategy_name": STRATEGY_METADATA[strategy_key]["name"],
         "bucket": STRATEGY_METADATA[strategy_key]["bucket"],
         "initial_capital": _clean_float(initial_capital, 100000.0, 2),
-        "ending_equity": _clean_float(final_mark_equity, initial_capital, 2),
-        "core_cash_end": _clean_float(core_cash, initial_capital * core_pct, 2),
-        "intraday_cash_end": _clean_float(intraday_cash, initial_capital * intraday_pct, 2),
-        "net_pnl": _clean_float(final_mark_equity - initial_capital, 0.0, 2),
-        "net_return_pct": _clean_float(net_return_pct, 0.0, 2),
-        "buy_hold_pct": _clean_float(buy_hold_ret, 0.0, 2),
-        "total_trades": total_trades,
-        "long_trades": long_trades,
-        "short_trades": short_trades,
-        "win_rate_pct": _clean_float(win_rate, 0.0, 1),
-        "profit_factor": _clean_float(min(profit_factor, 99.9), 0.0, 2),
-        "max_dd_pct": _clean_float(max_dd_pct, 0.0, 2)
+        "ending_equity": _clean_float(initial_capital, 100000.0, 2),
+        "core_cash_end": _clean_float(initial_capital * core_pct, 100000.0, 2),
+        "intraday_cash_end": _clean_float(initial_capital * intraday_pct, 100000.0, 2),
+        "net_pnl": 0.0,
+        "net_return_pct": 0.0,
+        "buy_hold_pct": _clean_float(((closes[-1] - closes[0]) / max(closes[0], 1e-6)) * 100.0, 0.0, 2) if n > 1 else 0.0,
+        "total_trades": len(boxes),
+        "long_trades": sum(1 for b in boxes if b["side"] == "LONG"),
+        "short_trades": sum(1 for b in boxes if b["side"] == "SHORT"),
+        "win_rate_pct": 0.0,
+        "profit_factor": 0.0,
+        "max_dd_pct": 0.0
     }
 
     return {
-        "trades": trades,
+        "trades": [],
         "markers": markers,
         "boxes": boxes,
         "stats": stats,
         "equity": equity_curve
     }
 
-# ==============================================================================
-# 4. BLACK-SCHOLES GREEKS & YAHOO LIVE OPTION CHAIN (UP TO 60 DAYS) + HISTORY
-# ==============================================================================
 def black_scholes_analysis(
     S: float, K: float, days_to_expiry: int, iv_pct: float,
     r_pct: float, gk_daily_vol_pct: float, opt_type: str = "call"
@@ -1479,9 +1051,6 @@ def api_option_contract_history(
         "bars": bars
     })
 
-# ==============================================================================
-# 5. MAIN BACKTEST, BAR INSPECTOR & CHART FASTAPI ENDPOINT
-# ==============================================================================
 @app.get("/api/analyze")
 def api_analyze(
     ticker: str = Query("SNDK"),
@@ -1758,15 +1327,12 @@ def api_options_greeks(
         r_pct=r_pct, gk_daily_vol_pct=gk_daily_vol_pct, opt_type=opt_type
     )
 
-# ==============================================================================
-# 6. FRONTEND SINGLE-PAGE APPLICATION
-# ==============================================================================
 HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Quant Lab: Dual-System Re-Entry & Trade Inspector</title>
+    <title>Quant Lab: Signal & SL/TP Projection Engine</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         :root {
@@ -1905,7 +1471,7 @@ HTML_PAGE = r"""
         </div>
         <label style="color:#00e5ff; font-weight:600;">System SL/TP Engine Mode</label>
         <select id="engine_mode" onchange="asyncActionWrapper(loadChartData)">
-            <option value="dynamic" selected>New Dynamic System (Adaptive Volatility + Continuous Trailing Stops)</option>
+            <option value="dynamic" selected>New Dynamic System (Adaptive Volatility + Projected SL/TP Boxes)</option>
             <option value="original">Original Code Mode (Fixed Multipliers & Standard Rules)</option>
         </select>
         <label style="color:#ffd600; font-weight:600;">EMA 200 Trend Filter (Applies to All Strategies)</label>
@@ -1929,7 +1495,7 @@ HTML_PAGE = r"""
     </details>
 
     <details class="fold-card" open>
-        <summary>2. Strategy & Continuous Re-Entry Formula</summary>
+        <summary>2. Strategy & Signal Projections</summary>
         <label>Active Strategy / Rule</label>
         <select id="strategy" onchange="onStrategyChange()">
             <option value="trend">1. Core Trend (EMA 20/50/200 + Volume L/S)</option>
@@ -2050,7 +1616,7 @@ HTML_PAGE = r"""
             <label class="chk-item"><input type="checkbox" id="chk_fib_levels" onchange="renderOverlays()"> Fibonacci Levels</label>
             <label class="chk-item"><input type="checkbox" id="chk_orb_levels" onchange="renderOverlays()"> ORB High/Low</label>
             <label class="chk-item"><input type="checkbox" id="chk_fvg_zones" checked onchange="renderOverlays()"> SMC FVG Boxes</label>
-            <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Shaded TP/SL Boxes</label>
+            <label class="chk-item"><input type="checkbox" id="chk_tpsl_boxes" checked onchange="renderOverlays()"> Projected SL/TP Boxes</label>
             <label class="chk-item"><input type="checkbox" id="chk_unclear" checked onchange="renderOverlays()"> Gray Volatile Area</label>
             <label class="chk-item"><input type="checkbox" id="chk_hover_hud" checked> Floating Hover HUD</label>
         </div>
@@ -2080,7 +1646,7 @@ HTML_PAGE = r"""
 
     <div class="replay-bar">
         <div class="replay-controls">
-            <span style="font-weight:700; color:#00b0ff; font-size:11.5px;">🎬 BAR-BY-BAR REPLAY:</span>
+            <span style="font-weight:700; color:#00b0ff; font-size:11.5px;">🎬 BAR-BY-BAR REPLAY (SIGNAL-ONLY MODE):</span>
             <button class="rp-btn" id="btn-replay-start" onclick="startBarReplay()">⏮ Start Replay</button>
             <button class="rp-btn" onclick="stepReplay(-1)" title="Step Back 1 Stick (Backspace)">◀ -1 Bar</button>
             <button class="rp-btn" onclick="stepReplay(1)" title="Advance Forward 1 Stick (Enter)">▶ +1 Bar (Next Stick)</button>
@@ -2398,7 +1964,6 @@ function initChart() {
         lineSeriesMap[k] = chart.addLineSeries({ ...cfg, lastValueVisible: false, priceLineVisible: false });
     }
 
-    // Init Trade Inspector Sub-Chart
     const insContainer = document.getElementById('inspector-chart-container');
     inspectorChart = LightweightCharts.createChart(insContainer, {
         layout: { background: { type: 'solid', color: '#0b0e14' }, textColor: '#d1d4dc' },
@@ -2535,7 +2100,7 @@ function startBarReplay(startIdx = null) {
     if (startIdx !== null && startIdx >= 0 && startIdx < currentData.candles.length) {
         replayIndex = startIdx;
     } else {
-        replayIndex = 0;
+        replayIndex = 0; // Starts with oldest single candle
     }
     document.getElementById('btn-replay-start').classList.add('active');
     renderReplayFrame(true);
@@ -2802,7 +2367,6 @@ function recomputeManualReplaySim() {
         endingEquity: latestEq, netReturnPct: Number((((latestEq - initCap) / initCap) * 100).toFixed(2))
     };
 
-    // Update Live Trade Inspector Drawer
     updateLiveTradeInspector(candles, maxIdx);
 }
 
@@ -2850,7 +2414,7 @@ function renderReplayFrame(resetViewport = false) {
     const statusEl = document.getElementById('replay-status-text');
     if (replayActive) {
         const eqStr = manualSimResult ? ` | Manual Replay Equity: $${manualSimResult.endingEquity.toLocaleString()} (${manualSimResult.netReturnPct >= 0 ? '+' : ''}${manualSimResult.netReturnPct}%)` : '';
-        statusEl.textContent = `Bar ${maxIdx + 1} / ${currentData.candles.length} — ${curBarInfo.dt || ''} | Close: $${curBarInfo.c || ''}${eqStr}`;
+        statusEl.textContent = `Bar ${maxIdx + 1} / ${currentData.candles.length} (Signal-Only) — ${curBarInfo.dt || ''} | Close: $${curBarInfo.c || ''}${eqStr}`;
     } else {
         statusEl.textContent = '[Full History Mode]';
     }
@@ -3112,7 +2676,7 @@ function renderOverlays() {
         <b>${currentData.ticker} [${currentData.tf}]</b> (${currentData.first_date} to ${currentData.last_date} | ${maxIdx + 1}/${currentData.total_bars} bars | Server: ${currentData.server_updated_at})<br>
         Close: <b>$${lm.close}</b> | <span style="color:#ffd600">EMA 200: $${lm.ema200}</span> | ATR: $${lm.atr} | GK Vol: ${lm.gk_daily_vol_pct}%<br>
         <span style="color:#00e5ff">Engine: ${engineMode}</span> | <span style="color:#00e5ff">Filter: ${filterMode}</span><br>
-        <span style="color:#00e676">Strategy Equity: $${st.ending_equity.toLocaleString()} (${st.net_return_pct >= 0 ? '+' : ''}${st.net_return_pct}%)</span> | Trades: ${st.total_trades} (${st.long_trades}L/${st.short_trades}S) | Win Rate: ${st.win_rate_pct}%
+        <span style="color:#00e676">Strategy Signals: ${st.total_trades} Projected Zones</span>
     `;
     requestAnimationFrame(drawCanvasZones);
 }
@@ -3199,7 +2763,7 @@ function drawCanvasZones() {
                 ctx.strokeRect(x1 - 4, topY, w + 8, botY - topY);
                 ctx.fillStyle = '#00e5ff';
                 ctx.font = 'bold 11px sans-serif';
-                ctx.fillText(`Trade #${b.trade_no} (${b.side})`, x1 - 2, Math.max(14, topY - 4));
+                ctx.fillText(`Signal #${b.trade_no} (${b.side})`, x1 - 2, Math.max(14, topY - 4));
                 ctx.restore();
             }
         });
@@ -3209,15 +2773,12 @@ function drawCanvasZones() {
 function updateTradeLogTable(data) {
     const tbody = document.querySelector('#trade-log-table tbody');
     tbody.innerHTML = '';
-    const maxIdx = replayActive ? replayIndex : (data.candles.length - 1);
-    const cutoffTime = data.candles[maxIdx] ? data.candles[maxIdx].time : Infinity;
-    const stratTrades = (data.backtest.trades || []).filter(t => t.entry_time <= cutoffTime);
     const manTrades = manualSimResult ? manualSimResult.trades : [];
-    const trades = [...manTrades, ...stratTrades];
+    const trades = manTrades;
 
-    document.getElementById('trade-count-badge').textContent = `${trades.length} Executions (${manTrades.length} Manual Replay)`;
+    document.getElementById('trade-count-badge').textContent = `${trades.length} Manual Executions (${(data.backtest.boxes || []).length} Strategy Signals)`;
     if (trades.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="17" style="text-align:center; color:#787b86; padding:12px;">No trades triggered on this timeframe/view yet. Use Bar-by-Bar Replay or switch strategy.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="17" style="text-align:center; color:#787b86; padding:12px;">Strategy is in Signal-Only mode (showing projected SL/TP boxes). Use manual BUY/SHORT buttons above to execute manual orders.</td></tr>`;
         return;
     }
 
@@ -3279,10 +2840,10 @@ function updateSummaryTable(data) {
             <td>${row.bucket}</td>
             <td>$${row.ending_equity.toLocaleString()}</td>
             <td class="${cls}">${row.net_return_pct >= 0 ? '+' : ''}${row.net_return_pct}%</td>
-            <td>${row.total_trades} (${row.long_trades}L / ${row.short_trades}S)</td>
-            <td>${row.win_rate_pct}%</td>
-            <td>${row.profit_factor}</td>
-            <td class="neg">-${row.max_dd_pct}%</td>
+            <td>${row.total_trades} Signals</td>
+            <td>N/A (Signal-Only)</td>
+            <td>N/A</td>
+            <td class="neg">0.0%</td>
         `;
         tbody.appendChild(tr);
     });
