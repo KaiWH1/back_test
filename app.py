@@ -2228,7 +2228,7 @@ function recomputeManualReplaySim() {
         const tpPrice = isLong ? (ep + dTp * unitVol) : (ep - dTp * unitVol);
 
         const fullDist = Math.abs(tpPrice - ep);
-        const pctDist1 = ep * (Math.max(t1GainPct, 0.1) / 100.0);
+        const pctDist1 = ep * (Math.max(t1Gainpct, 0.1) / 100.0);
         const pctDist2 = ep * (Math.max(t2GainPct, 0.2) / 100.0);
         const d1 = Math.max(Math.min(pctDist1, fullDist * 0.5), ep * 0.002);
         const d2 = Math.max(Math.min(pctDist2, fullDist * 0.8), d1 * 1.35);
@@ -2338,7 +2338,9 @@ function recomputeManualReplaySim() {
 
         const eqAfter = closed ? cash : (cash + totalTradePnl);
         const retPct = (totalTradePnl / Math.max(posVal, 1)) * 100.0;
+        const boxEndIdx = closed ? Math.min(exitBarIdx, ord.entryIdx + 12) : Math.min(maxIdx, ord.entryIdx + 12);
         const exitCandle = candles[exitBarIdx];
+        const boxEndCandle = candles[boxEndIdx] || exitCandle;
         const exitInfo = currentData.bar_details[String(exitCandle.time)] || {};
 
         trades.push({
@@ -2354,7 +2356,7 @@ function recomputeManualReplaySim() {
             pnl: Number(totalTradePnl.toFixed(2)), ret_pct: Number(retPct.toFixed(2)), equity_after: Number(eqAfter.toFixed(2))
         });
         boxes.push({
-            trade_no: 100 + oIdx + 1, side: ord.side, t1: entryCandle.time, t2: exitCandle.time,
+            trade_no: 100 + oIdx + 1, side: ord.side, t1: entryCandle.time, t2: boxEndCandle.time,
             entry: Number(ep.toFixed(2)), tp: Number(tpPrice.toFixed(2)), sl: Number(initSlPrice.toFixed(2)),
             t1_lvl: Number(t1Target.toFixed(2)), t2_lvl: Number(t2Target.toFixed(2)), outcome: closed ? resType : 'ACTIVE'
         });
