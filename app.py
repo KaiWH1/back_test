@@ -11,13 +11,12 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Dual-System Re-Entry & Dynamic SL/TP Engine")
+app = FastAPI(title="Quant Lab: Dual-System Re-Entry & Trade Inspector")
 
 # ==============================================================================
 # 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
 # ==============================================================================
 def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -> float:
-    """Safely converts any number/numpy scalar to a finite Python float."""
     try:
         f = float(val)
         if math.isnan(f) or math.isinf(f):
@@ -27,7 +26,6 @@ def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -
         return default
 
 def _sanitize_for_json(obj: Any) -> Any:
-    """Recursively cleans dicts/lists so json.dumps never sees NaN or Infinity."""
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -1768,7 +1766,7 @@ HTML_PAGE = r"""
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Quant Lab: Dual-System Re-Entry & Dynamic SL/TP Engine</title>
+    <title>Quant Lab: Dual-System Re-Entry & Trade Inspector</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         :root {
@@ -2116,6 +2114,15 @@ HTML_PAGE = r"""
     </div>
 
     <div class="bottom-panels">
+        <!-- LIVE TRADE INSPECTOR DRAWER -->
+        <details class="fold-card bottom-fold" id="inspector-drawer" style="display:none; border-color:#00b0ff;">
+            <summary style="color:#00b0ff;">
+                <span>🔍 Live Trade Inspector (Focused Intra-Trade Zoom View)</span>
+                <span id="inspector-status" style="font-size:11px; color:#ffd600; margin-right:10px;"></span>
+            </summary>
+            <div style="width:100%; height:180px;" id="inspector-chart-container"></div>
+        </details>
+
         <details class="fold-card bottom-fold" open ontoggle="resizeChart()">
             <summary>
                 <span>Active Strategy & Bar-by-Bar Replay Trade Execution Log (Click Any Row to Smart-Zoom Trade on Chart)</span>
@@ -2236,6 +2243,9 @@ HTML_PAGE = r"""
 <script>
 let chart, candleSeries, volumeSeries;
 let lineSeriesMap = {};
+let inspectorChart = null;
+let inspectorCandleSeries = null;
+
 let currentData = null;
 let currentTF = "1Y";
 let currentStartTs = null;
@@ -2340,6 +2350,10 @@ function resizeChart() {
     const wrap = document.getElementById('chart-wrap');
     chart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
     requestAnimationFrame(drawCanvasZones);
+    if (inspectorChart) {
+        const insWrap = document.getElementById('inspector-chart-container');
+        if (insWrap) inspectorChart.applyOptions({ width: insWrap.clientWidth, height: insWrap.clientHeight });
+    }
 }
 
 function initChart() {
@@ -2383,6 +2397,20 @@ function initChart() {
     for (const [k, cfg] of Object.entries(lineConfigs)) {
         lineSeriesMap[k] = chart.addLineSeries({ ...cfg, lastValueVisible: false, priceLineVisible: false });
     }
+
+    // Init Trade Inspector Sub-Chart
+    const insContainer = document.getElementById('inspector-chart-container');
+    inspectorChart = LightweightCharts.createChart(insContainer, {
+        layout: { background: { type: 'solid', color: '#0b0e14' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#1a1f2e' }, horzLines: { color: '#1a1f2e' } },
+        rightPriceScale: { borderColor: '#2a2e39', autoScale: true },
+        timeScale: { borderColor: '#2a2e39', timeVisible: true }
+    });
+    inspectorCandleSeries = inspectorChart.addCandlestickSeries({
+        upColor: '#00e676', downColor: '#ff1744',
+        borderUpColor: '#00e676', borderDownColor: '#ff1744',
+        wickUpColor: '#00e676', wickDownColor: '#ff1744'
+    });
 
     chart.timeScale().subscribeVisibleTimeRangeChange(() => requestAnimationFrame(drawCanvasZones));
     chart.timeScale().subscribeVisibleLogicalRangeChange(() => requestAnimationFrame(drawCanvasZones));
@@ -2551,6 +2579,7 @@ function stopBarReplay() {
     replayActive = false;
     document.getElementById('btn-replay-start').classList.remove('active');
     document.getElementById('replay-status-text').textContent = '[Full History Mode]';
+    document.getElementById('inspector-drawer').style.display = 'none';
     if (!currentData) return;
     replayIndex = currentData.candles.length - 1;
     renderReplayFrame(true);
@@ -2751,7 +2780,7 @@ function recomputeManualReplaySim() {
             trade_no: 100 + oIdx + 1, side: ord.side, signal_type: `MANUAL REPLAY (${ord.allocPct}% Eq)`,
             pool: `Manual (${ord.allocPct}% Portfolio)`, entry_bar_idx: ord.entryIdx, exit_bar_idx: exitBarIdx,
             entry_time: entryCandle.time, entry_dt: bInfo.dt || String(entryCandle.time),
-            exit_time: exitCandle.time, exit_dt: closed ? (exitInfo.dt || String(entryCandle.time)) : 'OPEN (Replay Active)',
+            exit_time: exitCandle.time, exit_dt: closed ? (exitInfo.dt || String(exitCandle.time)) : 'OPEN (Replay Active)',
             type: resType, entry_price: Number(ep.toFixed(2)), exit_price: Number(exitPrice.toFixed(2)),
             sl_price: Number(initSlPrice.toFixed(2)), tp_price: Number(tpPrice.toFixed(2)),
             dyn_mults: `${dSl.toFixed(2)}x`, scale_summary: scaleNotes.length > 0 ? scaleNotes.join(' -> ') : (closed ? '100% @ Exit' : `OPEN (${remShares}sh)`),
@@ -2772,6 +2801,32 @@ function recomputeManualReplaySim() {
         trades, markers, boxes, hasOpenPosition: hasOpenPos,
         endingEquity: latestEq, netReturnPct: Number((((latestEq - initCap) / initCap) * 100).toFixed(2))
     };
+
+    // Update Live Trade Inspector Drawer
+    updateLiveTradeInspector(candles, maxIdx);
+}
+
+function updateLiveTradeInspector(candles, maxIdx) {
+    const drawer = document.getElementById('inspector-drawer');
+    const statusEl = document.getElementById('inspector-status');
+    if (!replayActive || !manualSimResult || !manualSimResult.hasOpenPosition) {
+        if (drawer) drawer.style.display = 'none';
+        return;
+    }
+
+    const activeOrders = manualSimResult.trades.filter(t => t.entry_bar_idx <= maxIdx && maxIdx <= t.exit_bar_idx);
+    if (activeOrders.length === 0) {
+        drawer.style.display = 'none';
+        return;
+    }
+
+    drawer.style.display = 'block';
+    const trade = activeOrders[activeOrders.length - 1];
+    statusEl.textContent = `${trade.side} @ $${trade.entry_price} | SL: $${trade.sl_price} | PnL: ${trade.ret_pct >= 0 ? '+' : ''}${trade.ret_pct}%`;
+
+    const subCandles = candles.slice(trade.entry_bar_idx, maxIdx + 1);
+    inspectorCandleSeries.setData(subCandles);
+    inspectorChart.timeScale().fitContent();
 }
 
 function renderReplayFrame(resetViewport = false) {
