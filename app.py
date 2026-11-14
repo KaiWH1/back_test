@@ -11,13 +11,12 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-app = FastAPI(title="Quant Lab: Signal-Only Replay & Dual-System Engine")
+app = FastAPI(title="Quant Lab: Dual-System Re-Entry & Trade Inspector")
 
 # ==============================================================================
 # 0. STRICT JSON SANITIZER (PREVENTS NaN / Inf ValueError CRASHES)
 # ==============================================================================
 def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -> float:
-    """Safely converts any number/numpy scalar to a finite Python float."""
     try:
         f = float(val)
         if math.isnan(f) or math.isinf(f):
@@ -27,7 +26,6 @@ def _clean_float(val: Any, default: float = 0.0, digits: Optional[int] = None) -
         return default
 
 def _sanitize_for_json(obj: Any) -> Any:
-    """Recursively cleans dicts/lists so json.dumps never sees NaN or Infinity."""
     if isinstance(obj, dict):
         return {k: _sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -1768,7 +1766,7 @@ HTML_PAGE = r"""
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Quant Lab: Signal-Only Replay & Trade Inspector</title>
+    <title>Quant Lab: Dual-System Re-Entry & Trade Inspector</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         :root {
@@ -2082,7 +2080,7 @@ HTML_PAGE = r"""
 
     <div class="replay-bar">
         <div class="replay-controls">
-            <span style="font-weight:700; color:#00b0ff; font-size:11.5px;">🎬 BAR-BY-BAR REPLAY (SIGNAL-ONLY MODE):</span>
+            <span style="font-weight:700; color:#00b0ff; font-size:11.5px;">🎬 BAR-BY-BAR REPLAY:</span>
             <button class="rp-btn" id="btn-replay-start" onclick="startBarReplay()">⏮ Start Replay</button>
             <button class="rp-btn" onclick="stepReplay(-1)" title="Step Back 1 Stick (Backspace)">◀ -1 Bar</button>
             <button class="rp-btn" onclick="stepReplay(1)" title="Advance Forward 1 Stick (Enter)">▶ +1 Bar (Next Stick)</button>
@@ -2400,6 +2398,7 @@ function initChart() {
         lineSeriesMap[k] = chart.addLineSeries({ ...cfg, lastValueVisible: false, priceLineVisible: false });
     }
 
+    // Init Trade Inspector Sub-Chart
     const insContainer = document.getElementById('inspector-chart-container');
     inspectorChart = LightweightCharts.createChart(insContainer, {
         layout: { background: { type: 'solid', color: '#0b0e14' }, textColor: '#d1d4dc' },
@@ -2536,7 +2535,7 @@ function startBarReplay(startIdx = null) {
     if (startIdx !== null && startIdx >= 0 && startIdx < currentData.candles.length) {
         replayIndex = startIdx;
     } else {
-        replayIndex = 0; // Starts with oldest single candle
+        replayIndex = 0;
     }
     document.getElementById('btn-replay-start').classList.add('active');
     renderReplayFrame(true);
@@ -2803,6 +2802,7 @@ function recomputeManualReplaySim() {
         endingEquity: latestEq, netReturnPct: Number((((latestEq - initCap) / initCap) * 100).toFixed(2))
     };
 
+    // Update Live Trade Inspector Drawer
     updateLiveTradeInspector(candles, maxIdx);
 }
 
@@ -2841,9 +2841,7 @@ function renderReplayFrame(resetViewport = false) {
 
     recomputeManualReplaySim();
 
-    // REPLAY SIGNAL-ONLY MODE: Only show algorithmic signal markers (arrows/circles) up to cutoffTime. 
-    // Automated background backtest trades are suppressed during replay so you monitor signals & make manual decisions.
-    const stratMarkers = replayActive ? (currentData.backtest.markers || []).filter(m => m.time <= cutoffTime && (m.text.includes('WATCH') || m.text.includes('BUY') || m.text.includes('SHORT'))) : (currentData.backtest.markers || []).filter(m => m.time <= cutoffTime);
+    const stratMarkers = (currentData.backtest.markers || []).filter(m => m.time <= cutoffTime);
     const manMarkers = manualSimResult ? manualSimResult.markers : [];
     const combinedMarkers = [...stratMarkers, ...manMarkers].sort((a, b) => a.time - b.time);
     candleSeries.setMarkers(combinedMarkers);
@@ -2852,7 +2850,7 @@ function renderReplayFrame(resetViewport = false) {
     const statusEl = document.getElementById('replay-status-text');
     if (replayActive) {
         const eqStr = manualSimResult ? ` | Manual Replay Equity: $${manualSimResult.endingEquity.toLocaleString()} (${manualSimResult.netReturnPct >= 0 ? '+' : ''}${manualSimResult.netReturnPct}%)` : '';
-        statusEl.textContent = `Bar ${maxIdx + 1} / ${currentData.candles.length} (Signal-Only) — ${curBarInfo.dt || ''} | Close: $${curBarInfo.c || ''}${eqStr}`;
+        statusEl.textContent = `Bar ${maxIdx + 1} / ${currentData.candles.length} — ${curBarInfo.dt || ''} | Close: $${curBarInfo.c || ''}${eqStr}`;
     } else {
         statusEl.textContent = '[Full History Mode]';
     }
