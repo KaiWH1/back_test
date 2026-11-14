@@ -2228,7 +2228,7 @@ function recomputeManualReplaySim() {
         const tpPrice = isLong ? (ep + dTp * unitVol) : (ep - dTp * unitVol);
 
         const fullDist = Math.abs(tpPrice - ep);
-        const pctDist1 = ep * (Math.max(t1Gainpct, 0.1) / 100.0);
+        const pctDist1 = ep * (Math.max(t1GainPct, 0.1) / 100.0); // Fixed typo here
         const pctDist2 = ep * (Math.max(t2GainPct, 0.2) / 100.0);
         const d1 = Math.max(Math.min(pctDist1, fullDist * 0.5), ep * 0.002);
         const d2 = Math.max(Math.min(pctDist2, fullDist * 0.8), d1 * 1.35);
