@@ -2622,12 +2622,13 @@ function initChart() {
 // BAR-BY-BAR REPLAY ENGINE & MANUAL PORTFOLIO % SIMULATOR
 // ==============================================================================
 function startBarReplay(startIdx = null) {
-    if (!currentData || !currentData.candles || currentData.candles.length < 2) return;
+    if (!currentData || !currentData.candles || currentData.candles.length < 1) return;
     replayActive = true;
     if (startIdx !== null && startIdx >= 0 && startIdx < currentData.candles.length) {
         replayIndex = startIdx;
-    } else if (!replayActive || replayIndex <= 0 || replayIndex >= currentData.candles.length - 1) {
-        replayIndex = Math.max(1, Math.min(currentData.candles.length - 2, Math.floor(currentData.candles.length * 0.65)));
+    } else {
+        // Start strictly at index 0 (the oldest candle on the chart)
+        replayIndex = 0;
     }
     document.getElementById('btn-replay-start').classList.add('active');
     renderReplayFrame(true);
@@ -2692,7 +2693,7 @@ function clearManualReplayHistory() {
 function executeManualReplayOrder(side) {
     if (!currentData || !currentData.candles || currentData.candles.length === 0) return;
     if (!replayActive) {
-        startBarReplay(Math.max(1, currentData.candles.length - 20));
+        startBarReplay(0);
     }
     recomputeManualReplaySim();
     if (manualSimResult && manualSimResult.hasOpenPosition) {
