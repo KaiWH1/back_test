@@ -725,6 +725,7 @@ def run_strategy_backtest(
     scale_notes: List[str] = []
     entry_signal_reason = ""
     dollar_risk_at_entry = 0.0
+    running_extreme = 0.0  # Tracks highest high for longs / lowest low for shorts
 
     trades = []
     markers = []
@@ -890,11 +891,13 @@ def run_strategy_backtest(
                     tp_price = entry_price + cur_tp_mult * safe_atr
                     alt_sl_price = entry_price - cur_sl_mult * safe_gk
                     alt_tp_price = entry_price + cur_tp_mult * safe_gk
+                    running_extreme = c_high
                 else:
                     sl_price = entry_price + cur_sl_mult * safe_atr
                     tp_price = entry_price - cur_tp_mult * safe_atr
                     alt_sl_price = entry_price + cur_sl_mult * safe_gk
                     alt_tp_price = entry_price - cur_tp_mult * safe_gk
+                    running_extreme = c_low
 
                 sh, d_risk = _calc_shares(entry_price, sl_price, force_alloc_pct=manual_alloc_pct)
                 if sh > 0:
@@ -942,6 +945,7 @@ def run_strategy_backtest(
                 tp_price = entry_price + cur_tp_mult * unit_vol
                 alt_sl_price = entry_price - cur_sl_mult * safe_gk
                 alt_tp_price = entry_price + cur_tp_mult * safe_gk
+                running_extreme = c_high
 
                 sh, d_risk = _calc_shares(entry_price, sl_price)
                 if sh > 0:
@@ -981,6 +985,7 @@ def run_strategy_backtest(
                 tp_price = entry_price - cur_tp_mult * unit_vol
                 alt_sl_price = entry_price + cur_sl_mult * safe_gk
                 alt_tp_price = entry_price - cur_tp_mult * safe_gk
+                running_extreme = c_low
 
                 sh, d_risk = _calc_shares(entry_price, sl_price)
                 if sh > 0:
@@ -1006,10 +1011,14 @@ def run_strategy_backtest(
 
         # ACTIVE LONG POSITION MANAGEMENT
         elif state == 2:
+            # UNIVERSAL TRAILING STOP-LOSS: Track highest peak and ratchet SL upward
+            if c_high > running_extreme:
+                running_extreme = c_high
+            potential_trailing_sl = running_extreme - (cur_sl_mult * unit_vol)
+            if potential_trailing_sl > sl_price:
+                sl_price = potential_trailing_sl
+
             if is_no_tp:
-                potential_new_sl = ema20[i] - (cur_sl_mult * unit_vol)
-                if potential_new_sl > sl_price:
-                    sl_price = potential_new_sl
                 trend_reversal = (c_close < ema50[i] and ema20[i] < ema50[i])
             else:
                 trend_reversal = False
@@ -1133,10 +1142,14 @@ def run_strategy_backtest(
 
         # ACTIVE SHORT POSITION MANAGEMENT
         elif state == -2:
+            # UNIVERSAL TRAILING STOP-LOSS: Track lowest trough and ratchet SL downward
+            if c_low < running_extreme:
+                running_extreme = c_low
+            potential_trailing_sl = running_extreme + (cur_sl_mult * unit_vol)
+            if potential_trailing_sl < sl_price:
+                sl_price = potential_trailing_sl
+
             if is_no_tp:
-                potential_new_sl = ema20[i] + (cur_sl_mult * unit_vol)
-                if potential_new_sl < sl_price:
-                    sl_price = potential_new_sl
                 trend_reversal = (c_close > ema50[i] and ema20[i] > ema50[i])
             else:
                 trend_reversal = False
@@ -2627,7 +2640,7 @@ function startBarReplay(startIdx = null) {
     if (startIdx !== null && startIdx >= 0 && startIdx < currentData.candles.length) {
         replayIndex = startIdx;
     } else {
-        // Start strictly at index 0 (the oldest candle on the chart)
+        // STRICT REQUIREMENT: Clear everything and start replay at index 0 (the oldest single candle)
         replayIndex = 0;
     }
     document.getElementById('btn-replay-start').classList.add('active');
@@ -2774,6 +2787,7 @@ function recomputeManualReplaySim() {
         let exitBarIdx = maxIdx;
         let exitPrice = candles[maxIdx].close;
         let resType = 'OPEN';
+        let runningExtreme = isLong ? entryCandle.high : entryCandle.low;
 
         markers.push({
             time: entryCandle.time,
@@ -2798,6 +2812,17 @@ function recomputeManualReplaySim() {
                     shape: isLong ? 'arrowDown' : 'arrowUp', text: `MANUAL CLOSE (${realizedPnl >= 0 ? '+' : ''}$${Math.round(realizedPnl).toLocaleString()})`
                 });
                 break;
+            }
+
+            // Universal trailing stop-loss simulation for manual orders
+            if (isLong) {
+                if (c.high > runningExtreme) runningExtreme = c.high;
+                const potentialSl = runningExtreme - (dSl * unitVol);
+                if (potentialSl > slPrice) slPrice = potentialSl;
+            } else {
+                if (c.low < runningExtreme) runningExtreme = c.low;
+                const potentialSl = runningExtreme + (dSl * unitVol);
+                if (potentialSl < slPrice) slPrice = potentialSl;
             }
 
             const hitSlFirst = isLong ? (c.low <= slPrice) : (c.high >= slPrice);
