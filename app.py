@@ -2201,8 +2201,6 @@ function recomputeManualReplaySim() {
     const enableLadder = document.getElementById('enable_scale_out').checked;
     const t1GainPct = parseFloat(document.getElementById('t1_gain_pct').value) || 4.0;
     const t1SellPct = parseFloat(document.getElementById('t1_sell_pct').value) || 35.0;
-    const t2GainPct = parseFloat(document.getElementById('t2_gain_pct').value) || 8.0;
-    const t2SellPct = parseFloat(document.getElementById('t2_sell_pct').value) || 35.0;
     const isNoTp = (document.getElementById('strategy').value === 'no_tp_trend');
     const useOriginal = (document.getElementById('engine_mode').value === 'original');
 
@@ -2221,19 +2219,10 @@ function recomputeManualReplaySim() {
         const isLong = (ord.side === 'LONG');
         const unitVol = bInfo.unit_vol || bInfo.atr || (ep * 0.015);
         const dSl = bInfo.dyn_sl_mult || parseFloat(document.getElementById('sl_mult').value) || 1.5;
-        const dTp = isNoTp ? 999.0 : (bInfo.dyn_tp_mult || parseFloat(document.getElementById('tp_mult').value) || 2.8);
 
         let slPrice = isLong ? (ep - dSl * unitVol) : (ep + dSl * unitVol);
         const initSlPrice = slPrice;
-        const tpPrice = isLong ? (ep + dTp * unitVol) : (ep - dTp * unitVol);
-
-        const fullDist = Math.abs(tpPrice - ep);
-        const pctDist1 = ep * (Math.max(t1GainPct, 0.1) / 100.0); // Fixed typo here
-        const pctDist2 = ep * (Math.max(t2GainPct, 0.2) / 100.0);
-        const d1 = Math.max(Math.min(pctDist1, fullDist * 0.5), ep * 0.002);
-        const d2 = Math.max(Math.min(pctDist2, fullDist * 0.8), d1 * 1.35);
-        const t1Target = isLong ? (ep + d1) : (ep - d1);
-        const t2Target = isLong ? (ep + d2) : (ep - d2);
+        const tpPrice = isLong ? 999999.0 : -999999.0; // Disabled static TP
 
         const targetDollars = cash * (ord.allocPct / 100.0);
         const initShares = Math.max(1, Math.floor(targetDollars / Math.max(ep, 0.01)));
@@ -2242,7 +2231,6 @@ function recomputeManualReplaySim() {
         const dollarRisk = initShares * Math.abs(ep - initSlPrice);
 
         let realizedPnl = 0.0;
-        let scaleStage = 0;
         let scaleNotes = [];
         let closed = false;
         let exitBarIdx = maxIdx;
@@ -2285,40 +2273,18 @@ function recomputeManualReplaySim() {
                 }
             }
 
-            const hitSlFirst = isLong ? (c.low <= slPrice) : (c.high >= slPrice);
-            if (isNoTp) {
-                const curBInfo = currentData.bar_details[String(c.time)] || {};
-                const potentialNewSl = isLong ? (curBInfo.ema20 - dSl * unitVol) : (curBInfo.ema20 + dSl * unitVol);
-                if (isLong && potentialNewSl > slPrice) slPrice = potentialNewSl;
-                if (!isLong && potentialNewSl < slPrice) slPrice = potentialNewSl;
-            }
-
-            if (enableLadder && !isNoTp && !useOriginal && !hitSlFirst && remShares >= 3) {
-                if (scaleStage === 0 && (isLong ? (c.high >= t1Target && t1Target < tpPrice) : (c.low <= t1Target && t1Target > tpPrice))) {
-                    const qty1 = Math.min(remShares - 1, Math.max(1, Math.round(initShares * (t1SellPct / 100.0))));
-                    const p1 = (isLong ? (t1Target - ep) : (ep - t1Target)) * qty1;
-                    realizedPnl += p1;
-                    remShares -= qty1;
-                    scaleStage = 1;
-                    slPrice = isLong ? Math.max(slPrice, ep) : Math.min(slPrice, ep);
-                    scaleNotes.push("T1(-" + qty1 + "sh)");
-                }
-            }
-
-            const hitTp = (c.high >= tpPrice) && !isNoTp;
             const hitSl = isLong ? (c.low <= slPrice) : (c.high >= slPrice);
-
-            if (hitTp || hitSl) {
-                exitPrice = hitTp ? tpPrice : slPrice;
+            if (hitSl) {
+                exitPrice = slPrice;
                 const remPnl = (isLong ? (exitPrice - ep) : (ep - exitPrice)) * remShares;
                 realizedPnl += remPnl;
                 remShares = 0;
                 closed = true;
                 exitBarIdx = j;
-                resType = hitTp ? 'TP' : (realizedPnl > 0 ? 'TRAIL-WIN' : 'SL');
+                resType = realizedPnl > 0 ? 'TRAIL-WIN' : 'SL';
                 markers.push({
                     time: c.time, position: isLong ? 'aboveBar' : 'belowBar',
-                    color: (hitTp || realizedPnl > 0) ? '#FFD600' : '#FF1744',
+                    color: realizedPnl > 0 ? '#FFD600' : '#FF1744',
                     shape: isLong ? 'arrowDown' : 'arrowUp',
                     text: `${isLong ? 'L' : 'S'}-${resType} (${realizedPnl >= 0 ? '+' : ''}$${Math.round(realizedPnl).toLocaleString()})`
                 });
@@ -2349,7 +2315,7 @@ function recomputeManualReplaySim() {
             entry_time: entryCandle.time, entry_dt: bInfo.dt || String(entryCandle.time),
             exit_time: exitCandle.time, exit_dt: closed ? (exitInfo.dt || String(exitCandle.time)) : 'OPEN (Replay Active)',
             type: resType, entry_price: Number(ep.toFixed(2)), exit_price: Number(exitPrice.toFixed(2)),
-            sl_price: Number(initSlPrice.toFixed(2)), tp_price: Number(tpPrice.toFixed(2)),
+            sl_price: Number(initSlPrice.toFixed(2)), tp_price: 0,
             dyn_mults: `${dSl.toFixed(2)}x`, scale_summary: scaleNotes.length > 0 ? scaleNotes.join(' -> ') : (closed ? '100% @ Exit' : `OPEN (${remShares}sh)`),
             shares: initShares, position_value: Number(posVal.toFixed(2)), alloc_pct: Number(ord.allocPct.toFixed(1)),
             dollar_risk: Number(dollarRisk.toFixed(2)), bar_volume: bInfo.vol || 0, bar_rvol: bInfo.rvol || 1.0,
@@ -2357,8 +2323,8 @@ function recomputeManualReplaySim() {
         });
         boxes.push({
             trade_no: 100 + oIdx + 1, side: ord.side, t1: entryCandle.time, t2: boxEndCandle.time,
-            entry: Number(ep.toFixed(2)), tp: Number(tpPrice.toFixed(2)), sl: Number(initSlPrice.toFixed(2)),
-            t1_lvl: Number(t1Target.toFixed(2)), t2_lvl: Number(t2Target.toFixed(2)), outcome: closed ? resType : 'ACTIVE'
+            entry: Number(ep.toFixed(2)), tp: Number(ep.toFixed(2)), sl: Number(initSlPrice.toFixed(2)),
+            t1_lvl: Number(ep.toFixed(2)), t2_lvl: Number(ep.toFixed(2)), outcome: closed ? resType : 'ACTIVE'
         });
     }
 
@@ -2734,31 +2700,27 @@ function drawCanvasZones() {
         const manBoxes = manualSimResult ? manualSimResult.boxes : [];
         const allBoxes = [...stratBoxes, ...manBoxes];
 
+
         allBoxes.forEach(b => {
             const x1 = tsScale.timeToCoordinate(b.t1);
             const x2 = tsScale.timeToCoordinate(Math.min(b.t2, cutoffTime));
             const yEntry = candleSeries.priceToCoordinate(b.entry);
-            const yTp = candleSeries.priceToCoordinate(b.tp);
             const ySl = candleSeries.priceToCoordinate(b.sl);
-            if (x1 === null || x2 === null || yEntry === null || yTp === null || ySl === null) return;
+            if (x1 === null || x2 === null || yEntry === null || ySl === null) return;
 
             const w = Math.max(x2 - x1, 14);
             const isFocused = (focusedTradeNo !== null && b.trade_no === focusedTradeNo);
 
-            ctx.fillStyle = isFocused ? 'rgba(0, 230, 118, 0.28)' : 'rgba(0, 230, 118, 0.15)';
-            ctx.strokeStyle = isFocused ? '#00e676' : 'rgba(0, 230, 118, 0.75)';
-            ctx.lineWidth = isFocused ? 2 : 1;
-            ctx.fillRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
-            ctx.strokeRect(x1, Math.min(yTp, yEntry), w, Math.abs(yEntry - yTp));
-
+            // Render ONLY the Stop-Loss risk box (Red)
             ctx.fillStyle = isFocused ? 'rgba(255, 23, 68, 0.28)' : 'rgba(255, 23, 68, 0.15)';
             ctx.strokeStyle = isFocused ? '#ff1744' : 'rgba(255, 23, 68, 0.75)';
+            ctx.lineWidth = isFocused ? 2 : 1;
             ctx.fillRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
             ctx.strokeRect(x1, Math.min(yEntry, ySl), w, Math.abs(ySl - yEntry));
 
             if (isFocused) {
-                const topY = Math.min(yTp, ySl, yEntry) - 6;
-                const botY = Math.max(yTp, ySl, yEntry) + 6;
+                const topY = Math.min(ySl, yEntry) - 6;
+                const botY = Math.max(ySl, yEntry) + 6;
                 ctx.save();
                 ctx.strokeStyle = '#00e5ff';
                 ctx.lineWidth = 2.5;
